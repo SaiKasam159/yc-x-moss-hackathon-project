@@ -2,54 +2,159 @@
 LiveKit voice agent — Zone A.
 
 Pipeline: STT (Deepgram, word-level timestamps) -> trigger check -> Moss
-retrieval (only if triggered) -> LLM -> TTS (Kokoro-82M, fallback edge-tts).
+retrieval (only if triggered) -> LLM -> TTS (edge-tts today; Kokoro-82M
+stubbed, see _synthesize_kokoro).
 
-This needs low-level control between STT and LLM (not the high-level
-VoicePipelineAgent convenience wrapper) so a trigger firing can inject
-retrieved Moss context into the LLM call before it runs.
+Uses low-level LiveKit Agents primitives (JobContext + manual STT stream +
+manual AudioSource publish), not the high-level VoicePipelineAgent wrapper,
+because a trigger firing needs to inject retrieved Moss context into the LLM
+call before it runs — the high-level wrapper doesn't expose that seam.
 
-STUB: no real LiveKit session wiring yet. This lays out the shape of the
-loop and where each piece plugs in. Requires LIVEKIT_URL/API_KEY/API_SECRET
-and DEEPGRAM_API_KEY (see .env.example) once implemented for real.
+status: the turn-handling logic (handle_turn, triggers, Moss, fallback
+bridging, transcript/audio recording) is real and testable right now with
+zero external keys — run `python -m agent.agent --dry-run`. The live
+LiveKit/Deepgram wiring below (entrypoint, _forward_audio, STT/TTS plumbing)
+is written against the current livekit-agents / livekit-plugins-deepgram
+APIs as best as I can without being able to run it — there is no
+LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET/DEEPGRAM_API_KEY available in
+this environment to actually place a call and prove it end-to-end. Once you
+add those to .env, this is the part to verify first (exact field/method
+names can drift between plugin versions).
 """
 
 from __future__ import annotations
 
+import asyncio
+import datetime
+import io
+import json
+import logging
 import os
-from dataclasses import dataclass
-from typing import Optional
+import sqlite3
+import wave
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Awaitable, Callable, Optional
 
-from agent.call_script import CallScript, CallState
-from agent.triggers import check_wrong_answer, check_symptom_flag, TriggerResult
+from agent.call_script import CallScript, CallState, orientation_expected_answer
+from agent.triggers import TriggerResult, check_symptom_flag, check_wrong_answer
 from db.contracts import MossQARecord
 from db.moss_client import ingest_qa_record, query_patient_history
+
+logger = logging.getLogger("agent")
+
+# --- env / config ----------------------------------------------------------
 
 LIVEKIT_URL = os.environ.get("LIVEKIT_URL")
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY")
 LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET")
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
-TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "kokoro")  # "kokoro" | "edge-tts"
+# Kokoro tried first per spec; defaults to edge-tts because Kokoro isn't
+# wired yet (see _synthesize_kokoro for why) — flip this once it is.
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "edge-tts")  # "kokoro" | "edge-tts"
+EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AriaNeural")
 
-# TODO(agent): pick and wire an LLM provider for response generation.
-# Not yet decided — see README "Open questions". Needs its own env var
-# (e.g. LLM_API_KEY) once chosen.
+SAMPLE_RATE = 16000
+NUM_CHANNELS = 1
 
+CALLS_DIR = Path(os.environ.get("CALLS_DIR", "calls"))
+DB_PATH = os.environ.get("DB_PATH", "voice_checkin.db")
+
+# No dead air: if retrieval + LLM follow-up generation takes longer than
+# this, speak the bridging phrase first, then the real follow-up once ready.
+FALLBACK_TIMEOUT_S = float(os.environ.get("FALLBACK_TIMEOUT_S", "1.2"))
+FALLBACK_PHRASE = "Can you tell me a bit more about that?"
+
+# Hardcoded single test patient/call — priority-1 round-trip proof. Replace
+# with real patient lookup once multi-patient flow is needed.
+TEST_PATIENT_ID = 1
+TEST_CALL_ID = 1
+TEST_PATIENT_NAME = "Test Patient"
+TEST_BASELINE_BREAKFAST_ANSWER = "eggs"  # stands in for a baseline-call lookup
+
+
+def _now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+# --- turn context / handling ------------------------------------------------
 
 @dataclass
 class TurnContext:
     patient_id: int
     call_id: int
-    expected_answer: Optional[str] = None  # for RECALL_CHECK, pulled from baseline call
+    # question_id -> known-correct answer text, for RECALL_CHECK prompts
+    # whose expected answer isn't computed dynamically (i.e. personal
+    # recall, not orientation — see call_script.orientation_expected_answer).
+    expected_answers: dict[str, str] = field(default_factory=dict)
 
 
-def handle_turn(script: CallScript, ctx: TurnContext, answer_text: str) -> str:
-    """Given one captured answer, decide whether to retrieve + follow up, or
-    advance to the next scripted state. Returns the text the agent should say
-    next (a follow-up question, or the next scripted prompt).
+@dataclass
+class TurnOutcome:
+    reply_text: str
+    trigger: TriggerResult
+    used_fallback: bool = False
 
-    This is the STT -> [trigger check] -> [Moss retrieval] -> LLM boundary
-    that needs low-level LiveKit Agents control to intercept.
+
+def _resolve_expected_answer(script: CallScript, ctx: TurnContext) -> Optional[str]:
+    qid = script.current_question_id()
+    dynamic = orientation_expected_answer(qid)
+    if dynamic is not None:
+        return dynamic
+    return ctx.expected_answers.get(qid)
+
+
+async def _retrieve_and_generate_followup(
+    script: CallScript, ctx: TurnContext, record: MossQARecord, trigger: TriggerResult
+) -> str:
+    """The Moss retrieval + LLM follow-up step that runs when a trigger
+    fires. Wrapped in asyncio.to_thread since moss_client's stub (and a real
+    Moss SDK client) may be synchronous."""
+    context_records = await asyncio.to_thread(
+        query_patient_history,
+        patient_id=ctx.patient_id,
+        query_text=trigger.query_text or record.answer_text,
+        question_topic=record.question_topic,
+    )
+    return await generate_followup_llm(trigger, context_records)
+
+
+async def speak_with_fallback(
+    generate: Awaitable[str], speak: Callable[[str], Awaitable[None]]
+) -> str:
+    """Race `generate` against FALLBACK_TIMEOUT_S. If it's not ready in
+    time, speak the bridging phrase first (so there's never dead air), then
+    speak the real result once it lands. Returns the text actually used as
+    the final reply.
+    """
+    task = asyncio.ensure_future(generate)
+    try:
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=FALLBACK_TIMEOUT_S)
+        return result
+    except asyncio.TimeoutError:
+        await speak(FALLBACK_PHRASE)
+        result = await task  # already in flight, just await completion
+        return result
+
+
+async def handle_turn(
+    script: CallScript,
+    ctx: TurnContext,
+    answer_text: str,
+    speak: Callable[[str], Awaitable[None]],
+    word_timestamps: Optional[list] = None,
+) -> TurnOutcome:
+    """Given one captured answer: ingest it into Moss, run the relevant
+    trigger check for the current state, and return what the agent should
+    say next — either an informed follow-up (trigger fired) or the next
+    scripted prompt (trigger didn't fire / call complete).
+
+    `speak` is called directly (not just returned) when the fallback phrase
+    is needed mid-generation, so the caller doesn't need to know that
+    happened to avoid dead air.
     """
     record = MossQARecord(
         patient_id=ctx.patient_id,
@@ -57,57 +162,391 @@ def handle_turn(script: CallScript, ctx: TurnContext, answer_text: str) -> str:
         question_id=script.current_question_id(),
         question_topic=script.state.name.lower(),
         answer_text=answer_text,
-        timestamp=__import__("datetime").datetime.utcnow().isoformat() + "Z",
+        timestamp=_now_iso(),
+        extra={"word_timestamps": word_timestamps} if word_timestamps else {},
     )
-    ingest_qa_record(record)
+    await asyncio.to_thread(ingest_qa_record, record)
 
     trigger: TriggerResult = TriggerResult(fired=False)
     if script.state == CallState.RECALL_CHECK:
-        trigger = check_wrong_answer(answer_text, ctx.expected_answer)
+        trigger = check_wrong_answer(answer_text, _resolve_expected_answer(script, ctx))
     elif script.state == CallState.OPEN_QA:
         trigger = check_symptom_flag(answer_text)
 
     if trigger.fired:
-        context_records = query_patient_history(
-            patient_id=ctx.patient_id,
-            query_text=trigger.query_text or answer_text,
-            question_topic=record.question_topic,
-        )
-        # TODO(agent): feed `context_records` + `trigger.reason` into the LLM
-        # call to generate an informed follow-up question, instead of this
-        # placeholder.
-        return f"[TODO(agent): LLM follow-up using {len(context_records)} retrieved records — {trigger.reason}]"
+        logger.info("trigger fired on %s: %s", record.question_id, trigger.reason)
+        generate = _retrieve_and_generate_followup(script, ctx, record, trigger)
+        before = asyncio.get_event_loop().time()
+        reply = await speak_with_fallback(generate, speak)
+        used_fallback = (asyncio.get_event_loop().time() - before) >= FALLBACK_TIMEOUT_S
+        return TurnOutcome(reply_text=reply, trigger=trigger, used_fallback=used_fallback)
 
-    script.advance()
+    next_prompt = script.advance()
     if script.is_complete():
-        return "That's everything for today — thanks for checking in!"
-    return script.current_prompts()[0]
+        return TurnOutcome(reply_text="That's everything for today — thanks for checking in!", trigger=trigger)
+    return TurnOutcome(reply_text=next_prompt, trigger=trigger)
 
 
-def run_call(patient_id: int, call_id: int, expected_answer: Optional[str] = None) -> None:
-    """Entry point for a live call session. STUB — no real LiveKit room /
-    STT / TTS wiring yet.
+# --- LLM follow-up generation ------------------------------------------------
 
-    TODO(agent):
-      - connect to LiveKit room (LIVEKIT_URL/API_KEY/API_SECRET)
-      - stream mic audio -> Deepgram STT (word-level timestamps on, for
-        ml/audio.py pause detection downstream)
-      - on each finalized STT turn, call handle_turn(...)
-      - synthesize the returned text via Kokoro-82M (fall back to edge-tts)
-        and play it into the room
-      - loop until script.is_complete()
+_anthropic_client = None
+
+
+def _get_llm_client():
+    global _anthropic_client
+    if _anthropic_client is None:
+        from anthropic import AsyncAnthropic  # local import: optional dep until an LLM key exists
+        _anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic_client
+
+
+async def generate_followup_llm(trigger: TriggerResult, context_records: list[MossQARecord]) -> str:
+    """Generate one short, informed follow-up question using retrieved Moss
+    context. Degrades to a templated question (no network call) when
+    ANTHROPIC_API_KEY isn't set, so the whole loop stays runnable without an
+    LLM key — same spirit as db/moss_client.py's STUB_MODE.
     """
+    context_lines = [f"- ({r.timestamp}) {r.answer_text}" for r in context_records]
+    context_str = "\n".join(context_lines) or "(no related prior answers on file)"
+
+    if not ANTHROPIC_API_KEY:
+        logger.warning("ANTHROPIC_API_KEY not set — using templated follow-up instead of a real LLM call.")
+        return "Can you say more about that? I want to make sure I understand what you meant."
+
+    client = _get_llm_client()
+    system = (
+        "You are a warm, brief phone check-in assistant for a Parkinson's "
+        f"patient. A trigger fired during the call: {trigger.reason}. "
+        "Using the retrieved context below, ask ONE short, natural, "
+        "non-alarming follow-up question. Do not diagnose or give medical "
+        "advice. One sentence only."
+    )
+    message = await client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=100,
+        system=system,
+        messages=[{"role": "user", "content": f"Retrieved context:\n{context_str}\n\nGenerate the follow-up question."}],
+    )
+    return message.content[0].text.strip()
+
+
+# --- TTS ---------------------------------------------------------------------
+
+async def synthesize_speech(text: str) -> bytes:
+    """Returns PCM16 mono audio at SAMPLE_RATE for `text`, via whichever
+    provider TTS_PROVIDER selects."""
+    if TTS_PROVIDER == "edge-tts":
+        return await _synthesize_edge_tts(text)
+    if TTS_PROVIDER == "kokoro":
+        return await _synthesize_kokoro(text)
+    raise ValueError(f"Unknown TTS_PROVIDER: {TTS_PROVIDER!r}")
+
+
+async def _synthesize_edge_tts(text: str) -> bytes:
+    """edge-tts: free, no API key, works today. Streams mp3, decoded to
+    PCM16 via PyAV (pip-installable, no system ffmpeg/espeak-ng needed)."""
+    import edge_tts
+
+    communicate = edge_tts.Communicate(text, EDGE_TTS_VOICE)
+    mp3_bytes = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            mp3_bytes.extend(chunk["data"])
+    return _decode_to_pcm16(bytes(mp3_bytes))
+
+
+async def _synthesize_kokoro(text: str) -> bytes:
+    """Kokoro-82M self-hosted TTS — tried first per spec, NOT wired yet.
+
+    Deferred because getting it running needs, beyond a pip install:
+      - the `espeak-ng` phonemizer backend, a system-level package
+        (`brew install espeak-ng` on macOS) — exactly the kind of install
+        this project asks to confirm before running
+      - ~327MB of model weights to download
+      - likely `torch` as a dependency (heavier install than edge-tts)
+
+    That's more setup than fits a "get one round trip proven" first step,
+    so TTS_PROVIDER defaults to edge-tts for now. To switch: confirm the
+    espeak-ng install, `pip install kokoro`, set TTS_PROVIDER=kokoro and
+    KOKORO_MODEL_PATH in .env, and implement synthesis here (e.g. via the
+    `kokoro` package's KPipeline, matching the return contract above:
+    PCM16 mono bytes at SAMPLE_RATE).
+    """
+    raise NotImplementedError("Kokoro TTS not wired yet — see docstring. Using TTS_PROVIDER=edge-tts instead.")
+
+
+def _decode_to_pcm16(compressed_audio: bytes) -> bytes:
+    """Decode mp3 (or anything PyAV's ffmpeg build reads) to raw PCM16 mono
+    at SAMPLE_RATE, for LiveKit AudioFrame publishing."""
+    import av
+
+    container = av.open(io.BytesIO(compressed_audio))
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+    pcm = bytearray()
+    stream = container.streams.audio[0]
+    for packet in container.demux(stream):
+        for frame in packet.decode():
+            for resampled in resampler.resample(frame):
+                pcm.extend(bytes(resampled.planes[0]))
+    return bytes(pcm)
+
+
+# --- call recording (audio + transcript with word-level timestamps) --------
+
+class CallRecorder:
+    """Writes call audio to <CALLS_DIR>/<call_id>/audio.wav and a transcript
+    (with Deepgram word-level timestamps on patient turns) to
+    <CALLS_DIR>/<call_id>/transcript.json, then records both paths into the
+    `calls` table per db/schema.sql (audio_path, transcript_path) — without
+    modifying db/schema.sql or db/contracts.py.
+    """
+
+    def __init__(self, call_id: int, patient_id: int, calls_dir: Path = CALLS_DIR):
+        self.call_id = call_id
+        self.patient_id = patient_id
+        self.call_dir = calls_dir / str(call_id)
+        self.call_dir.mkdir(parents=True, exist_ok=True)
+        self.audio_path = self.call_dir / "audio.wav"
+        self.transcript_path = self.call_dir / "transcript.json"
+        self.turns: list[dict] = []
+
+        self._wav = wave.open(str(self.audio_path), "wb")
+        self._wav.setnchannels(NUM_CHANNELS)
+        self._wav.setsampwidth(2)  # PCM16
+        self._wav.setframerate(SAMPLE_RATE)
+
+    def write_audio_frame(self, pcm16_bytes: bytes) -> None:
+        self._wav.writeframes(pcm16_bytes)
+
+    def log_patient_turn(self, text: str, word_timestamps: Optional[list] = None) -> None:
+        self.turns.append({
+            "speaker": "patient",
+            "text": text,
+            "words": word_timestamps or [],
+            "timestamp": _now_iso(),
+        })
+
+    def log_agent_turn(self, text: str) -> None:
+        self.turns.append({"speaker": "agent", "text": text, "timestamp": _now_iso()})
+
+    def finalize(self, db_path: str = DB_PATH) -> None:
+        self._wav.close()
+        with open(self.transcript_path, "w") as f:
+            json.dump(
+                {"call_id": self.call_id, "patient_id": self.patient_id, "turns": self.turns},
+                f, indent=2,
+            )
+        _record_call_row(db_path, self.call_id, self.patient_id, str(self.audio_path), str(self.transcript_path))
+        logger.info("call %s recorded: %s, %s", self.call_id, self.audio_path, self.transcript_path)
+
+
+def _record_call_row(db_path: str, call_id: int, patient_id: int, audio_path: str, transcript_path: str) -> None:
+    """Insert/update this call's row using the existing schema (read-only
+    use of db/schema.sql — does not modify it)."""
+    schema_sql = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(schema_sql.read_text())
+        conn.execute(
+            "INSERT OR IGNORE INTO patients (id, name) VALUES (?, ?)",
+            (patient_id, TEST_PATIENT_NAME),
+        )
+        conn.execute(
+            """
+            INSERT INTO calls (id, patient_id, timestamp, audio_path, transcript_path)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET audio_path=excluded.audio_path, transcript_path=excluded.transcript_path
+            """,
+            (call_id, patient_id, _now_iso(), audio_path, transcript_path),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# --- dry run (no external keys needed) --------------------------------------
+
+async def dry_run() -> None:
+    """Exercises the full turn-handling loop — call script, both triggers,
+    stub Moss retrieval, fallback bridging, LLM step (templated if
+    ANTHROPIC_API_KEY is unset) — with scripted fake patient answers.
+    Zero LiveKit/Deepgram/Moss/LLM keys required. This is the "prove the
+    pipeline works" check that's actually runnable in this environment.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     script = CallScript()
-    ctx = TurnContext(patient_id=patient_id, call_id=call_id, expected_answer=expected_answer)
-    print(f"[stub] would start call {call_id} for patient {patient_id}")
-    print(f"[stub] first prompt: {script.current_prompts()[0]}")
-    raise NotImplementedError("Real LiveKit session loop not wired yet.")
+    ctx = TurnContext(
+        patient_id=TEST_PATIENT_ID,
+        call_id=TEST_CALL_ID,
+        expected_answers={"recall_check:2": TEST_BASELINE_BREAKFAST_ANSWER},
+    )
+    recorder = CallRecorder(TEST_CALL_ID, TEST_PATIENT_ID)
+
+    async def speak(text: str) -> None:
+        print(f"AGENT: {text}")
+        recorder.log_agent_turn(text)
+
+    # Scripted answers per question_id, as a queue: a triggering first answer
+    # (wrong recall / symptom mention) followed by a clean follow-up answer,
+    # so the follow-up round the agent asks actually gets resolved instead
+    # of re-triggering on the same wrong answer forever. Everything else is
+    # a single plausible "correct" answer.
+    scripted_answers: dict[str, list[str]] = {
+        "recall_check:0": [datetime.date.today().strftime("%A")],          # correct — no trigger
+        "recall_check:1": ["definitely not a season", "sorry, I meant fall"],   # WRONG, then corrected — triggers once
+        "recall_check:2": ["I had toast, not eggs", "oh you're right, I had eggs"],  # WRONG vs baseline — triggers once
+        "sustained_phonation:0": ["ahhhhh"],
+        "reading_task:0": ["The old dog stretched slowly..."],
+        "open_qa:0": ["I've been okay, but my hands have had a bit of a tremor lately.", "it's mild, comes and goes"],  # triggers symptom flag once
+        "open_qa:1": ["Nothing major otherwise."],
+        "counting_task:0": ["1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20"],
+    }
+    answer_iters = {qid: iter(answers) for qid, answers in scripted_answers.items()}
+
+    def next_answer(qid: str) -> str:
+        try:
+            return next(answer_iters.get(qid, iter(())))
+        except StopIteration:
+            return "that's all, thank you"  # never re-triggers — safe default once a qid's queue is exhausted
+
+    await speak(script.current_prompt())
+    max_turns = 30  # safety net against any future scripting bug causing an infinite loop
+    for _ in range(max_turns):
+        if script.is_complete():
+            break
+        qid = script.current_question_id()
+        answer = next_answer(qid)
+        print(f"PATIENT: {answer}")
+        recorder.log_patient_turn(answer)
+
+        outcome = await handle_turn(script, ctx, answer, speak=speak)
+        await speak(outcome.reply_text)
+        if outcome.trigger.fired:
+            print(f"  (trigger: {outcome.trigger.reason} | fallback used: {outcome.used_fallback})")
+    else:
+        print(f"[dry-run] hit max_turns={max_turns} safety cap without completing — check for a trigger loop.")
+
+    recorder.finalize()
+    print(f"\nTranscript: {recorder.transcript_path}")
+    print(f"Audio (silent placeholder in dry-run — no real TTS/mic captured): {recorder.audio_path}")
+
+
+# --- live LiveKit entrypoint --------------------------------------------------
+# NOT YET RUNNABLE without LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET and
+# DEEPGRAM_API_KEY in .env — see module docstring. Written against the
+# current livekit-agents / livekit-plugins-deepgram APIs; verify field/method
+# names against your installed versions once those keys are in place.
+
+async def _forward_audio(track, stt_stream) -> None:
+    from livekit import rtc
+    audio_stream = rtc.AudioStream(track)
+    async for event in audio_stream:
+        stt_stream.push_frame(event.frame)
+
+
+async def _play_pcm16(audio_source, pcm16_bytes: bytes, recorder: Optional[CallRecorder] = None) -> None:
+    from livekit import rtc
+
+    frame_ms = 20
+    bytes_per_frame = int(SAMPLE_RATE * frame_ms / 1000) * 2  # PCM16
+    for i in range(0, len(pcm16_bytes), bytes_per_frame):
+        chunk = pcm16_bytes[i:i + bytes_per_frame]
+        if not chunk:
+            continue
+        frame = rtc.AudioFrame(
+            data=chunk,
+            sample_rate=SAMPLE_RATE,
+            num_channels=NUM_CHANNELS,
+            samples_per_channel=len(chunk) // 2,
+        )
+        await audio_source.capture_frame(frame)
+    if recorder is not None:
+        recorder.write_audio_frame(pcm16_bytes)
+
+
+def _create_stt():
+    if not DEEPGRAM_API_KEY:
+        raise RuntimeError("DEEPGRAM_API_KEY not set — see .env.example")
+    from livekit.plugins import deepgram
+
+    # Deepgram returns word-level timestamps by default (the `words` array
+    # on each alternative); consumed below via alt.words.
+    return deepgram.STT(
+        api_key=DEEPGRAM_API_KEY,
+        model="nova-2",
+        language="en-US",
+        punctuate=True,
+        smart_format=True,
+        interim_results=True,
+    )
+
+
+async def entrypoint(ctx) -> None:
+    from livekit import rtc
+    from livekit.agents import AutoSubscribe
+    from livekit.agents import stt as lk_stt
+
+    if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        raise RuntimeError("LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET not set — see .env.example")
+
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    await ctx.wait_for_participant()
+
+    script = CallScript()
+    turn_ctx = TurnContext(
+        patient_id=TEST_PATIENT_ID,
+        call_id=TEST_CALL_ID,
+        expected_answers={"recall_check:2": TEST_BASELINE_BREAKFAST_ANSWER},
+    )
+    recorder = CallRecorder(TEST_CALL_ID, TEST_PATIENT_ID)
+
+    audio_source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
+    track = rtc.LocalAudioTrack.create_audio_track("agent-voice", audio_source)
+    await ctx.room.local_participant.publish_track(track)
+
+    async def speak(text: str) -> None:
+        pcm = await synthesize_speech(text)
+        await _play_pcm16(audio_source, pcm, recorder=recorder)
+        recorder.log_agent_turn(text)
+
+    stt_stream = _create_stt().stream()
+
+    @ctx.room.on("track_subscribed")
+    def _on_track_subscribed(track_, *_args):
+        if track_.kind == rtc.TrackKind.KIND_AUDIO:
+            asyncio.create_task(_forward_audio(track_, stt_stream))
+
+    await speak(script.current_prompt())
+
+    async for event in stt_stream:
+        if event.type != lk_stt.SpeechEventType.FINAL_TRANSCRIPT:
+            continue
+        alt = event.alternatives[0]
+        answer_text = alt.text
+        word_timestamps = [
+            {"word": w.word, "start": w.start_time, "end": w.end_time}
+            for w in getattr(alt, "words", [])
+        ]
+        recorder.log_patient_turn(answer_text, word_timestamps)
+
+        outcome = await handle_turn(script, turn_ctx, answer_text, speak=speak, word_timestamps=word_timestamps)
+        await speak(outcome.reply_text)
+
+        if script.is_complete():
+            break
+
+    recorder.finalize()
+
+
+def run_worker() -> None:
+    from livekit.agents import WorkerOptions, cli
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
 
 
 if __name__ == "__main__":
-    # Local dry run of the turn-handling logic only (no real call).
-    script = CallScript()
-    ctx = TurnContext(patient_id=1, call_id=1, expected_answer="eggs")
-    print("prompt:", script.current_prompts()[0])
-    next_prompt = handle_turn(script, ctx, "I had toast this morning")
-    print("agent says:", next_prompt)
+    import sys
+    if "--dry-run" in sys.argv or len(sys.argv) == 1:
+        asyncio.run(dry_run())
+    else:
+        run_worker()

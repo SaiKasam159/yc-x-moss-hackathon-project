@@ -1,8 +1,10 @@
 # --- Zone A: voice agent -----------------------------------------------
 livekit-agents>=0.11
 livekit-plugins-deepgram
-edge-tts                 # free TTS fallback if Kokoro setup stalls
-# kokoro / kokoro-onnx    # TODO: pin once Kokoro-82M self-host path is confirmed working
+edge-tts                 # default TTS — free, no key. Kokoro not wired yet (see agent/agent.py)
+av                        # decodes edge-tts's mp3 output to PCM for LiveKit AudioFrame publishing (pip-only, bundles ffmpeg — no system install)
+anthropic                 # LLM for mid-call follow-up generation (ANTHROPIC_API_KEY)
+# kokoro / kokoro-onnx    # TODO: needs system-level `espeak-ng` + ~327MB weights — confirm before installing, see agent/agent.py's _synthesize_kokoro
 
 # --- Moss (semantic retrieval) ------------------------------------------
 # TODO: add the real Moss Python SDK package name here once confirmed
