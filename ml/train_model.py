@@ -52,10 +52,10 @@ def load_uci_dataset() -> pd.DataFrame:
     """Fetch UCI Parkinson's Telemonitoring dataset (ID 189) and rename
     columns to match db.contracts.FeatureVector.
 
-    Falls back to loading from data/parkinsons_updrs.csv if UCI fetch fails
+    Falls back to loading from data/parkinsons_updrs.data if UCI fetch fails
     (e.g., SSL certificate issues in isolated environments).
     """
-    csv_path = Path("data/parkinsons_updrs.csv")
+    csv_path = Path("data/parkinsons_updrs.data")
 
     # Try UCI fetch first
     try:
