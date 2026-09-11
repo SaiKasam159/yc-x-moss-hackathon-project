@@ -14,5 +14,8 @@ pandas
 numpy
 # nolds                   # TODO: needed for rpde/dfa/ppe nonlinear-dynamics features — uncomment once ml/audio.py implements them
 
+# --- Zone: signup (patient onboarding) -----------------------------------
+Flask>=3.0
+
 # --- shared ---------------------------------------------------------------
 python-dotenv
