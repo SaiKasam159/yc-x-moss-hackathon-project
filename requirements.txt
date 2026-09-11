@@ -1,0 +1,18 @@
+# --- Zone A: voice agent -----------------------------------------------
+livekit-agents>=0.11
+livekit-plugins-deepgram
+edge-tts                 # free TTS fallback if Kokoro setup stalls
+# kokoro / kokoro-onnx    # TODO: pin once Kokoro-82M self-host path is confirmed working
+
+# --- Moss (semantic retrieval) ------------------------------------------
+# TODO: add the real Moss Python SDK package name here once confirmed
+
+# --- Zone B: ML pipeline -------------------------------------------------
+praat-parselmouth
+scikit-learn
+pandas
+numpy
+# nolds                   # TODO: needed for rpde/dfa/ppe nonlinear-dynamics features — uncomment once ml/audio.py implements them
+
+# --- shared ---------------------------------------------------------------
+python-dotenv

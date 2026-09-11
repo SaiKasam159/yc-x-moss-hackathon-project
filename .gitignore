@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+
+# large/generated artifacts
+/data/*
+!/data/.gitkeep
+*.wav
+*.pkl
+ml/model.pkl
