@@ -12,6 +12,7 @@ praat-parselmouth
 scikit-learn
 pandas
 numpy
+ucimlrepo                # UCI dataset fetcher
 # nolds                   # TODO: needed for rpde/dfa/ppe nonlinear-dynamics features — uncomment once ml/audio.py implements them
 
 # --- shared ---------------------------------------------------------------
