@@ -39,7 +39,7 @@ from typing import Awaitable, Callable, Optional
 from agent.call_script import CallScript, CallState, orientation_expected_answer
 from agent.triggers import TriggerResult, check_symptom_flag, check_wrong_answer
 from db.contracts import MossQARecord
-from db.moss_client import ingest_qa_record, query_patient_history
+from db.moss_client import ingest_qa_record, push_patient_session, query_patient_history
 
 logger = logging.getLogger("agent")
 
@@ -111,10 +111,9 @@ async def _retrieve_and_generate_followup(
     script: CallScript, ctx: TurnContext, record: MossQARecord, trigger: TriggerResult
 ) -> str:
     """The Moss retrieval + LLM follow-up step that runs when a trigger
-    fires. Wrapped in asyncio.to_thread since moss_client's stub (and a real
-    Moss SDK client) may be synchronous."""
-    context_records = await asyncio.to_thread(
-        query_patient_history,
+    fires. moss_client's real SessionIndex.query() runs in-memory (no
+    network round trip) so this stays fast enough for mid-call latency."""
+    context_records = await query_patient_history(
         patient_id=ctx.patient_id,
         query_text=trigger.query_text or record.answer_text,
         question_topic=record.question_topic,
@@ -165,7 +164,7 @@ async def handle_turn(
         timestamp=_now_iso(),
         extra={"word_timestamps": word_timestamps} if word_timestamps else {},
     )
-    await asyncio.to_thread(ingest_qa_record, record)
+    await ingest_qa_record(record)
 
     trigger: TriggerResult = TriggerResult(fired=False)
     if script.state == CallState.RECALL_CHECK:
@@ -428,6 +427,7 @@ async def dry_run() -> None:
         print(f"[dry-run] hit max_turns={max_turns} safety cap without completing — check for a trigger loop.")
 
     recorder.finalize()
+    await push_patient_session(ctx.patient_id)  # persist this patient's Moss session for their next call
     print(f"\nTranscript: {recorder.transcript_path}")
     print(f"Audio (silent placeholder in dry-run — no real TTS/mic captured): {recorder.audio_path}")
 
@@ -537,6 +537,7 @@ async def entrypoint(ctx) -> None:
             break
 
     recorder.finalize()
+    await push_patient_session(turn_ctx.patient_id)  # persist this patient's Moss session for their next call
 
 
 def run_worker() -> None:
