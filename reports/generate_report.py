@@ -1,16 +1,15 @@
 """
-Structured report generation — shared surface (reads from both zones' output).
+Deterministic report generation — shared surface (reads from both zones' output).
 
 Turns a FeatureVector + call transcript + UPDRS prediction + trigger flags
-into a structured human-readable report, and pushes a summary record to Moss
-so future calls can retrieve "last report said X" context.
-
-STUB: no real LLM call wired yet — provider TBD (see README "Open questions").
+into a structured human-readable report using templates, and pushes a summary
+record to Moss so future calls can retrieve "last report said X" context.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from db.contracts import FeatureVector, MossQARecord, UPDRSPrediction
 from db.moss_client import ingest_qa_record
@@ -25,6 +24,17 @@ class CallReport:
     anomaly_flag: bool
 
 
+ALERT_TEMPLATES = {
+    "elevated_jitter": "Elevated jitter detected — voice may indicate tremor or vocal instability.",
+    "elevated_shimmer": "Elevated shimmer detected — voice quality variation noted.",
+    "reduced_hnr": "Reduced harmonic-to-noise ratio — voice quality degradation.",
+    "elevated_pause_freq": "Frequent pauses during speech — may indicate cognitive or motor changes.",
+    "low_speech_rate": "Slowed speech rate — possible dysarthria or cognitive slowness.",
+    "high_updrs_pred": "UPDRS score trending higher — monitor symptom progression.",
+    "low_updrs_pred": "UPDRS score improved — positive trajectory.",
+}
+
+
 def generate_report(
     patient_id: int,
     features: FeatureVector,
@@ -32,16 +42,47 @@ def generate_report(
     prediction: UPDRSPrediction,
     flags: list[str],
 ) -> CallReport:
-    """TODO(reports): real LLM call to synthesize a structured report from
-    the transcript + extracted features + prediction + any trigger flags
-    raised during the call. Stubbed with a templated summary for now.
+    """Generate a deterministic report from extracted features and prediction.
+
+    Args:
+        patient_id: Patient ID
+        features: Extracted acoustic/prosody features
+        transcript: Call transcript (for context/logging, not for analysis)
+        prediction: UPDRS prediction from model
+        flags: List of detected anomaly flags
+
+    Returns:
+        CallReport with templated summary text
     """
-    summary_text = (
-        f"[STUB REPORT] Call {features.call_id} for patient {patient_id}: "
-        f"predicted UPDRS {prediction.predicted_score} ({prediction.confidence_band}). "
-        f"Flags raised: {flags or 'none'}. "
-        f"TODO(reports): replace with real LLM-generated summary from transcript."
+    sections = [
+        f"Patient {patient_id} | Call {features.call_id}",
+        f"Predicted UPDRS: {prediction.predicted_score} ({prediction.confidence_band})",
+    ]
+
+    # Add flag-based alerts
+    if flags:
+        alert_texts = [ALERT_TEMPLATES.get(f, f"Flag: {f}") for f in flags]
+        sections.append("Alerts:\n  • " + "\n  • ".join(alert_texts))
+
+    # Add feature summary
+    feature_summary = (
+        f"Acoustic profile: Jitter {features.jitter_local:.3f}%, "
+        f"Shimmer {features.shimmer_local:.2f}dB, "
+        f"HNR {features.hnr:.1f}dB, "
+        f"RPDE {features.rpde:.3f}"
     )
+    sections.append(feature_summary)
+
+    # Add prosody summary
+    prosody_summary = (
+        f"Speech: {features.speech_rate:.0f} wpm, "
+        f"Pause frequency {features.pause_freq:.2f}Hz, "
+        f"Avg pause {features.pause_avg_duration:.2f}s"
+    )
+    sections.append(prosody_summary)
+
+    summary_text = "\n".join(sections)
+
     return CallReport(
         call_id=features.call_id,
         patient_id=patient_id,
@@ -60,6 +101,6 @@ def push_report_to_moss(report: CallReport) -> None:
         question_id="report_summary",
         question_topic="report",
         answer_text=report.summary_text,
-        timestamp=__import__("datetime").datetime.utcnow().isoformat() + "Z",
+        timestamp=datetime.utcnow().isoformat() + "Z",
     )
     ingest_qa_record(record)

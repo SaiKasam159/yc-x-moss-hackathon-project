@@ -13,7 +13,10 @@ scikit-learn
 pandas
 numpy
 ucimlrepo                # UCI dataset fetcher
-# nolds                   # TODO: needed for rpde/dfa/ppe nonlinear-dynamics features — uncomment once ml/audio.py implements them
+librosa                  # Audio processing (loading, resampling, spectral features)
+soundfile                # Audio I/O
+webrtcvad                # Voice activity detection
+nolds                    # Nonlinear dynamics (RPDE, DFA, PPE)
 
 # --- shared ---------------------------------------------------------------
 python-dotenv
