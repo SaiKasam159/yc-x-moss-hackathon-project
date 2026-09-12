@@ -2,22 +2,28 @@
 Acoustic signal processing — Zone B.
 
 VAD, pause detection, phonation segment extraction, and jitter/shimmer/HNR
-extraction via parselmouth (Praat). Nonlinear dynamics (RPDE/DFA/PPE) via nolds.
+extraction via parselmouth (Praat). Nonlinear dynamics (RPDE/DFA/PPE) come
+from ml/nonlinear.py — see that module for why they aren't taken from nolds.
 """
 
 from __future__ import annotations
 
+import logging
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import librosa
-import nolds
 import numpy as np
 import parselmouth
 import webrtcvad
-from scipy import signal as sp_signal
 from scipy.io import wavfile
+
+from ml.nonlinear import dfa as _dfa
+from ml.nonlinear import ppe as _ppe
+from ml.nonlinear import rpde as _rpde
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -137,8 +143,10 @@ def extract_acoustic_features(phonation_audio_path: str) -> dict:
     """
     sound = parselmouth.Sound(phonation_audio_path)
 
-    # Pitch detection (required for jitter/shimmer)
-    pitch = sound.to_pitch(time_step=0.01, f0_min=50, f0_max=500)
+    # Pitch detection (required for jitter/shimmer and PPE).
+    # NB: the kwargs are pitch_floor/pitch_ceiling — parselmouth has no
+    # f0_min/f0_max parameters and raises TypeError if given them.
+    pitch = sound.to_pitch(time_step=0.01, pitch_floor=50, pitch_ceiling=500)
 
     # Point process for jitter calculation
     point_process = parselmouth.praat.call(sound, "To PointProcess (periodic, cc)", 75, 500)
@@ -151,47 +159,47 @@ def extract_acoustic_features(phonation_audio_path: str) -> dict:
         point_process, "Get jitter (rap)", 0, 0, 0.0001, 0.02, 1.3
     )
 
-    # Shimmer measurements
+    # Shimmer measurements. Praat's shimmer commands need BOTH the sound and
+    # the point process — passing the sound alone raises
+    # "Command not available for given objects".
     shimmer_local = parselmouth.praat.call(
-        sound, "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6
+        [sound, point_process], "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6
     )
     shimmer_apq5 = parselmouth.praat.call(
-        sound, "Get shimmer (apq5)", 0, 0, 0.0001, 0.02, 1.3, 1.6
+        [sound, point_process], "Get shimmer (apq5)", 0, 0, 0.0001, 0.02, 1.3, 1.6
     )
 
-    # HNR (Harmonic-to-Noise Ratio)
+    # HNR (Harmonic-to-Noise Ratio). "Get mean" on a Harmonicity object takes
+    # a time range (0, 0 = whole file); without it Praat rejects the command.
     harmonicity = sound.to_harmonicity_cc()
-    hnr = parselmouth.praat.call(harmonicity, "Get mean")
+    hnr = parselmouth.praat.call(harmonicity, "Get mean", 0, 0)
 
-    # Nonlinear dynamics features
-    # Load audio for RPDE/DFA/PPE calculation
+    # Nonlinear dynamics features (see ml/nonlinear.py).
+    # Failures are logged rather than silently swallowed: a feature that
+    # quietly becomes 0.0 for every call feeds a constant into the UPDRS
+    # model, which is worse than a visible error.
     y, sr = librosa.load(phonation_audio_path, sr=16000)
 
-    # RPDE (Recurrence Period Density Entropy)
     try:
-        rpde = nolds.rpde(y, emb_dim=2, delay=20)
+        rpde = _rpde(y, emb_dim=4, delay=int(0.001 * sr) or 1)
     except Exception:
-        rpde = 0.0  # Fallback if calculation fails
+        logger.warning("RPDE extraction failed for %s; using 0.0", phonation_audio_path, exc_info=True)
+        rpde = 0.0
 
-    # DFA (Detrended Fluctuation Analysis)
     try:
-        dfa = nolds.dfa(y)
+        dfa = _dfa(y)
     except Exception:
-        dfa = 0.0  # Fallback if calculation fails
+        logger.warning("DFA extraction failed for %s; using 0.0", phonation_audio_path, exc_info=True)
+        dfa = 0.0
 
-    # PPE (Pitch Period Entropy)
     try:
-        # PPE based on pitch values
-        pitch_values = pitch.selected_array("frequency")
-        pitch_values = pitch_values[pitch_values > 0]  # Remove unvoiced frames
-        if len(pitch_values) > 10:
-            # Entropy of pitch period distributions
-            pitch_diffs = np.diff(pitch_values)
-            ppe = -np.sum((pitch_diffs / np.sum(pitch_diffs)) * np.log2(pitch_diffs / np.sum(pitch_diffs) + 1e-10))
-        else:
-            ppe = 0.0
+        # NB: selected_array is a structured array property, not a method —
+        # `pitch.selected_array("frequency")` raises "not callable".
+        pitch_values = pitch.selected_array["frequency"]
+        ppe = _ppe(pitch_values)
     except Exception:
-        ppe = 0.0  # Fallback if calculation fails
+        logger.warning("PPE extraction failed for %s; using 0.0", phonation_audio_path, exc_info=True)
+        ppe = 0.0
 
     return {
         "jitter_local": float(jitter_local),
