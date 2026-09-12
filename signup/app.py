@@ -55,6 +55,14 @@ def init_db() -> None:
         conn.close()
 
 
+# Run at import time (not just under `if __name__ == "__main__"`), so the
+# table exists whenever this app is imported or served — by a test client,
+# by `flask run`, or by a real WSGI server (gunicorn etc. never execute the
+# __main__ block). Safe to run every time: init_db() is CREATE TABLE IF NOT
+# EXISTS only.
+init_db()
+
+
 def _clean(value) -> str:
     return (value or "").strip()
 
@@ -183,5 +191,4 @@ def signup():
 
 
 if __name__ == "__main__":
-    init_db()
     app.run(debug=True, port=5050)
