@@ -524,9 +524,16 @@ async def entrypoint(ctx) -> None:
             continue
         alt = event.alternatives[0]
         answer_text = alt.text
+        # livekit-agents >=1.x gives words as TimedString: a str subclass
+        # carrying start_time/end_time. There is no `.word` attribute — the
+        # word itself IS the string, so str(w) is the text.
         word_timestamps = [
-            {"word": w.word, "start": w.start_time, "end": w.end_time}
-            for w in getattr(alt, "words", [])
+            {
+                "word": str(w),
+                "start": getattr(w, "start_time", None),
+                "end": getattr(w, "end_time", None),
+            }
+            for w in (getattr(alt, "words", None) or [])
         ]
         recorder.log_patient_turn(answer_text, word_timestamps)
 
