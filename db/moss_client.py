@@ -79,8 +79,14 @@ async def _index_exists(client, name: str) -> bool:
 
 async def _to_document(record: MossQARecord):
     from moss import DocumentInfo
+    # One document per *turn*, not per question: doc id includes the
+    # timestamp so a follow-up answer (asked again after a trigger fires,
+    # same question_id) gets its own document instead of overwriting the
+    # original triggering answer. Every answer is kept, permanently
+    # retrievable, for model refinement — nothing in Moss is ever
+    # overwritten by a later answer to the same question.
     return DocumentInfo(
-        id=f"{record.call_id}:{record.question_id}",
+        id=f"{record.call_id}:{record.question_id}:{record.timestamp}",
         text=record.answer_text,
         metadata={
             "patient_id": str(record.patient_id),
