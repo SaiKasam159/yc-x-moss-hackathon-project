@@ -68,6 +68,16 @@ DB_PATH = os.environ.get("DB_PATH", "data/app.db")
 FALLBACK_TIMEOUT_S = float(os.environ.get("FALLBACK_TIMEOUT_S", "1.2"))
 FALLBACK_PHRASE = "Can you tell me a bit more about that?"
 
+# Most follow-ups to ask about any single question before moving on, so a
+# repeatedly-tripped trigger can't trap the call on one question.
+MAX_FOLLOWUPS_PER_QUESTION = int(os.environ.get("MAX_FOLLOWUPS_PER_QUESTION", "2"))
+
+# How long to wait for a final transcript before moving the call on anyway.
+# Essential, not just defensive: the SUSTAINED_PHONATION task asks for "ahhh",
+# which is not speech and which STT may never emit a final transcript for, and
+# a patient may simply stay silent. Without this the call waits forever.
+NO_ANSWER_TIMEOUT_S = float(os.environ.get("NO_ANSWER_TIMEOUT_S", "12"))
+
 # Hardcoded single test patient/call — priority-1 round-trip proof. Replace
 # with real patient lookup once multi-patient flow is needed.
 TEST_PATIENT_ID = 1
@@ -90,6 +100,11 @@ class TurnContext:
     # whose expected answer isn't computed dynamically (i.e. personal
     # recall, not orientation — see call_script.orientation_expected_answer).
     expected_answers: dict[str, str] = field(default_factory=dict)
+    # question_id -> how many follow-ups we've already asked on it. A fired
+    # trigger deliberately does NOT advance the script (so the patient can
+    # answer the follow-up), which means a patient who keeps tripping the
+    # check would loop on one question forever. See MAX_FOLLOWUPS_PER_QUESTION.
+    followup_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -172,8 +187,21 @@ async def handle_turn(
     elif script.state == CallState.OPEN_QA:
         trigger = check_symptom_flag(answer_text)
 
-    if trigger.fired:
-        logger.info("trigger fired on %s: %s", record.question_id, trigger.reason)
+    qid = record.question_id
+    already_followed_up = ctx.followup_counts.get(qid, 0)
+
+    if trigger.fired and already_followed_up >= MAX_FOLLOWUPS_PER_QUESTION:
+        # Don't ask a third time about the same question — move the call on.
+        # Without this a patient who keeps tripping the check (or whose
+        # answer keeps mis-transcribing) loops on one question forever and
+        # the call never reaches the later tasks.
+        logger.info(
+            "trigger fired on %s but follow-up limit (%d) reached — advancing",
+            qid, MAX_FOLLOWUPS_PER_QUESTION,
+        )
+    elif trigger.fired:
+        ctx.followup_counts[qid] = already_followed_up + 1
+        logger.info("trigger fired on %s: %s", qid, trigger.reason)
         generate = _retrieve_and_generate_followup(script, ctx, record, trigger)
         before = asyncio.get_event_loop().time()
         reply = await speak_with_fallback(generate, speak)
@@ -251,7 +279,10 @@ async def _synthesize_edge_tts(text: str) -> bytes:
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             mp3_bytes.extend(chunk["data"])
-    return _decode_to_pcm16(bytes(mp3_bytes))
+    # Decode off the event loop: PyAV is synchronous CPU work, and LiveKit
+    # warns ("event loop blocked for 1280ms") that blocking here delays
+    # outgoing audio and turn handling for the whole call.
+    return await asyncio.to_thread(_decode_to_pcm16, bytes(mp3_bytes))
 
 
 async def _synthesize_kokoro(text: str) -> bytes:
@@ -512,6 +543,19 @@ async def entrypoint(ctx) -> None:
 
     stt_stream = _create_stt().stream()
 
+    # Without this the job never ends when the patient hangs up: the STT
+    # stream just blocks, and LiveKit eventually force-cancels the entrypoint
+    # ("entrypoint did not exit in time"), so the call shuts down dirtily.
+    disconnected = asyncio.Event()
+
+    @ctx.room.on("participant_disconnected")
+    def _on_participant_disconnected(*_args):
+        disconnected.set()
+
+    @ctx.room.on("disconnected")
+    def _on_room_disconnected(*_args):
+        disconnected.set()
+
     @ctx.room.on("track_subscribed")
     def _on_track_subscribed(track_, *_args):
         if track_.kind == rtc.TrackKind.KIND_AUDIO:
@@ -519,25 +563,74 @@ async def entrypoint(ctx) -> None:
 
     await speak(script.current_prompt())
 
-    async for event in stt_stream:
-        if event.type != lk_stt.SpeechEventType.FINAL_TRANSCRIPT:
-            continue
-        alt = event.alternatives[0]
-        answer_text = alt.text
-        word_timestamps = [
-            {"word": w.word, "start": w.start_time, "end": w.end_time}
-            for w in getattr(alt, "words", [])
-        ]
-        recorder.log_patient_turn(answer_text, word_timestamps)
+    # The whole conversation runs under try/finally: a call that ends early —
+    # patient hangs up, network drops, the room closes — must still write its
+    # transcript and persist to Moss. Without this, anything short of a fully
+    # completed 5-stage call loses the transcript entirely (the audio survives,
+    # since wave writes incrementally, but every word and timestamp is gone),
+    # which is exactly the data the ML pipeline needs.
+    stt_iter = stt_stream.__aiter__()
+    try:
+        while not script.is_complete():
+            if disconnected.is_set():
+                logger.info("participant left — ending call %s", turn_ctx.call_id)
+                break
 
-        outcome = await handle_turn(script, turn_ctx, answer_text, speak=speak, word_timestamps=word_timestamps)
-        await speak(outcome.reply_text)
+            try:
+                event = await asyncio.wait_for(
+                    stt_iter.__anext__(), timeout=NO_ANSWER_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                # No transcript arrived. Either a non-speech task (the "ahhh"
+                # phonation stage never produces one) or a silent patient —
+                # either way, keep the call moving instead of hanging.
+                logger.info(
+                    "no transcript within %ss on %s — advancing",
+                    NO_ANSWER_TIMEOUT_S, script.current_question_id(),
+                )
+                next_prompt = script.advance()
+                if script.is_complete():
+                    await speak("That's everything for today — thanks for checking in!")
+                    break
+                await speak(next_prompt)
+                continue
+            except StopAsyncIteration:
+                break
 
-        if script.is_complete():
-            break
+            if event.type != lk_stt.SpeechEventType.FINAL_TRANSCRIPT:
+                continue
+            alt = event.alternatives[0]
+            answer_text = alt.text
+            # livekit-agents >=1.x gives words as TimedString: a str subclass
+            # carrying start_time/end_time. There is no `.word` attribute — the
+            # word itself IS the string, so str(w) is the text.
+            word_timestamps = [
+                {
+                    "word": str(w),
+                    "start": getattr(w, "start_time", None),
+                    "end": getattr(w, "end_time", None),
+                }
+                for w in (getattr(alt, "words", None) or [])
+            ]
+            recorder.log_patient_turn(answer_text, word_timestamps)
 
-    recorder.finalize()
-    await push_patient_session(turn_ctx.patient_id)  # persist this patient's Moss session for their next call
+            outcome = await handle_turn(
+                script, turn_ctx, answer_text, speak=speak, word_timestamps=word_timestamps
+            )
+            await speak(outcome.reply_text)
+
+            if script.is_complete():
+                break
+    finally:
+        try:
+            recorder.finalize()
+        except Exception:
+            logger.exception("failed to finalize call recording for call %s", turn_ctx.call_id)
+        try:
+            # Persist this patient's Moss session for their next call.
+            await push_patient_session(turn_ctx.patient_id)
+        except Exception:
+            logger.exception("failed to push Moss session for patient %s", turn_ctx.patient_id)
 
 
 def run_worker() -> None:
