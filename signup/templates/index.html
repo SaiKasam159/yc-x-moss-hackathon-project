@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Patient Check-in Signup</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="card">
+    <header>
+      <h1>Voice Check-in Signup</h1>
+      <p class="subtitle">
+        Register a loved one for periodic voice check-in calls. We'll alert
+        you if anything in a call suggests it's worth a closer look.
+      </p>
+    </header>
+
+    <form id="signup-form" novalidate>
+      <fieldset>
+        <legend>Patient</legend>
+
+        <label for="patient_name">Patient's full name</label>
+        <input type="text" id="patient_name" name="patient_name" required autocomplete="name" />
+        <p class="error" data-error-for="patient_name"></p>
+
+        <label for="phone_number">Patient's phone number</label>
+        <input type="tel" id="phone_number" name="phone_number" placeholder="(555) 123-4567" required autocomplete="tel" />
+        <p class="error" data-error-for="phone_number"></p>
+
+        <label for="timezone">Patient's timezone</label>
+        <select id="timezone" name="timezone" required></select>
+        <p class="error" data-error-for="timezone"></p>
+
+        <label>Preferred call time(s)</label>
+        <div id="call-times"></div>
+        <button type="button" id="add-time" class="link-button">+ Add another time</button>
+        <p class="error" data-error-for="preferred_call_times"></p>
+
+        <label for="call_frequency">Call frequency</label>
+        <select id="call_frequency" name="call_frequency">
+          <option value="daily">Daily</option>
+          <option value="twice_weekly">Twice a week</option>
+          <option value="weekly">Weekly</option>
+        </select>
+      </fieldset>
+
+      <fieldset>
+        <legend>You (caregiver)</legend>
+
+        <label for="caregiver_name">Your full name</label>
+        <input type="text" id="caregiver_name" name="caregiver_name" required autocomplete="name" />
+        <p class="error" data-error-for="caregiver_name"></p>
+
+        <label for="caregiver_email">Your email</label>
+        <input type="email" id="caregiver_email" name="caregiver_email" required autocomplete="email" />
+        <p class="error" data-error-for="caregiver_email"></p>
+
+        <label for="caregiver_phone">Your phone number</label>
+        <input type="tel" id="caregiver_phone" name="caregiver_phone" placeholder="(555) 987-6543" required autocomplete="tel" />
+        <p class="error" data-error-for="caregiver_phone"></p>
+      </fieldset>
+
+      <p class="form-error" id="form-error" hidden></p>
+
+      <button type="submit" id="submit-btn">Sign up</button>
+    </form>
+
+    <section id="confirmation" hidden>
+      <h2>You're all set</h2>
+      <p id="confirmation-text"></p>
+      <button type="button" id="signup-another">Sign up another patient</button>
+    </section>
+  </main>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>

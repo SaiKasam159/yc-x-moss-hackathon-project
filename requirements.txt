@@ -20,5 +20,8 @@ soundfile                # Audio I/O
 webrtcvad                # Voice activity detection
 nolds                    # Nonlinear dynamics (RPDE, DFA, PPE)
 
+# --- Zone: signup (patient onboarding) -----------------------------------
+Flask>=3.0
+
 # --- shared ---------------------------------------------------------------
 python-dotenv

@@ -61,7 +61,7 @@ SAMPLE_RATE = 16000
 NUM_CHANNELS = 1
 
 CALLS_DIR = Path(os.environ.get("CALLS_DIR", "calls"))
-DB_PATH = os.environ.get("DB_PATH", "voice_checkin.db")
+DB_PATH = os.environ.get("DB_PATH", "data/app.db")
 
 # No dead air: if retrieval + LLM follow-up generation takes longer than
 # this, speak the bridging phrase first, then the real follow-up once ready.
