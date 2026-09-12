@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice Check-in — Test Call</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    .call-card { text-align: center; }
+    .status {
+      margin: 1.25rem 0; padding: 0.75rem 1rem; border-radius: 8px;
+      background: #f1f5f9; color: #334155; font-size: 0.95rem;
+    }
+    .status.live { background: #dcfce7; color: #166534; }
+    .status.error { background: #fee2e2; color: #991b1b; text-align: left; }
+    .orb {
+      width: 96px; height: 96px; border-radius: 50%; margin: 1.5rem auto;
+      background: #e2e8f0; transition: transform .15s ease, background .2s ease;
+    }
+    .orb.agent-speaking { background: #4f6ef7; transform: scale(1.12); }
+    .orb.listening { background: #22c55e; }
+    .transcript {
+      text-align: left; margin-top: 1.5rem; max-height: 260px; overflow-y: auto;
+      border-top: 1px solid #e2e8f0; padding-top: 1rem;
+    }
+    .line { margin: 0.5rem 0; font-size: 0.95rem; line-height: 1.45; }
+    .line .who { font-weight: 600; margin-right: 0.4rem; }
+    .line.agent .who { color: #4f6ef7; }
+    .line.you .who { color: #16a34a; }
+    .hint { color: #64748b; font-size: 0.85rem; margin-top: 1rem; }
+    /* style.css only targets button[type=submit]; these are type=button */
+    .call-card button {
+      width: 100%; padding: 0.85rem 1rem; border: none; border-radius: 8px;
+      background: #4f6ef7; color: #fff; font-size: 1rem; font-weight: 600;
+      cursor: pointer; transition: background .15s ease;
+    }
+    .call-card button:hover { background: #4059d6; }
+    .call-card button:disabled { background: #94a3b8; cursor: not-allowed; }
+    .call-card button.danger { background: #dc2626; }
+    .call-card button.danger:hover { background: #b91c1c; }
+  </style>
+</head>
+<body>
+  <main class="card call-card">
+    <h1>Test Check-in Call</h1>
+    <p class="subtitle">Talk to the voice agent from your browser. It speaks first — just answer normally.</p>
+
+    <div class="orb" id="orb"></div>
+    <div class="status" id="status">Ready. Make sure the agent worker is running.</div>
+
+    <button type="button" id="start-btn">Start call</button>
+    <button type="button" id="end-btn" class="danger" hidden>End call</button>
+
+    <div class="transcript" id="transcript" hidden></div>
+
+    <p class="hint">
+      Tip: during the open questions, mention a tremor, stiffness or trouble
+      sleeping — that trips a symptom flag and the agent will pull your past
+      answers from Moss to ask an informed follow-up.
+    </p>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+  <script>
+    const startBtn = document.getElementById("start-btn");
+    const endBtn = document.getElementById("end-btn");
+    const statusEl = document.getElementById("status");
+    const orb = document.getElementById("orb");
+    const transcriptEl = document.getElementById("transcript");
+    let room = null;
+
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.className = "status" + (cls ? " " + cls : "");
+    }
+
+    function addLine(who, text) {
+      transcriptEl.hidden = false;
+      const div = document.createElement("div");
+      div.className = "line " + (who === "Agent" ? "agent" : "you");
+      div.innerHTML = '<span class="who"></span><span class="txt"></span>';
+      div.querySelector(".who").textContent = who + ":";
+      div.querySelector(".txt").textContent = text;
+      transcriptEl.appendChild(div);
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    async function startCall() {
+      startBtn.disabled = true;
+      setStatus("Getting a token…");
+      try {
+        const resp = await fetch("/api/call-token");
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || "Could not get a token");
+
+        setStatus("Connecting to " + data.room + "…");
+        room = new LivekitClient.Room({ adaptiveStream: true, dynacast: true });
+
+        room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
+          if (track.kind === "audio") {
+            // Attach so you actually hear the agent.
+            const el = track.attach();
+            el.autoplay = true;
+            document.body.appendChild(el);
+            setStatus("Connected — the agent is on the line.", "live");
+          }
+        });
+
+        room.on(LivekitClient.RoomEvent.ActiveSpeakersChanged, (speakers) => {
+          const agentTalking = speakers.some((s) => s.identity !== "patient-browser");
+          const youTalking = speakers.some((s) => s.identity === "patient-browser");
+          orb.className = "orb" + (agentTalking ? " agent-speaking" : youTalking ? " listening" : "");
+        });
+
+        room.on(LivekitClient.RoomEvent.ParticipantConnected, (p) => {
+          addLine("System", "Agent joined (" + p.identity + ")");
+        });
+
+        room.on(LivekitClient.RoomEvent.Disconnected, () => {
+          setStatus("Call ended.");
+          orb.className = "orb";
+          startBtn.disabled = false;
+          startBtn.hidden = false;
+          endBtn.hidden = true;
+        });
+
+        // Transcriptions, if the agent publishes them.
+        room.on(LivekitClient.RoomEvent.TranscriptionReceived, (segments, participant) => {
+          const who = participant && participant.identity === "patient-browser" ? "You" : "Agent";
+          segments.filter((s) => s.final).forEach((s) => addLine(who, s.text));
+        });
+
+        await room.connect(data.url, data.token);
+        await room.localParticipant.setMicrophoneEnabled(true);
+
+        setStatus("Connected — waiting for the agent to speak…", "live");
+        startBtn.hidden = true;
+        endBtn.hidden = false;
+      } catch (err) {
+        setStatus(
+          "Couldn't start the call: " + err.message +
+          "\n\nChecklist:\n• Is the agent worker running? (python -m agent.agent start)\n" +
+          "• Did you start this app with your .env loaded?\n" +
+          "• Did you allow microphone access?",
+          "error"
+        );
+        statusEl.style.whiteSpace = "pre-line";
+        startBtn.disabled = false;
+      }
+    }
+
+    async function endCall() {
+      if (room) await room.disconnect();
+    }
+
+    startBtn.addEventListener("click", startCall);
+    endBtn.addEventListener("click", endCall);
+  </script>
+</body>
+</html>

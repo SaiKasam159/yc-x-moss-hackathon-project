@@ -11,6 +11,7 @@ real LiveKit call — call-scheduling isn't built yet.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -119,6 +120,44 @@ def validate_signup(data: dict) -> list[str]:
 @app.route("/")
 def index():
     return send_from_directory(BASE_DIR / "templates", "index.html")
+
+
+@app.route("/call")
+def call_page():
+    """In-browser test call: talk to the voice agent without needing the
+    LiveKit playground or a phone number."""
+    return send_from_directory(BASE_DIR / "templates", "call.html")
+
+
+@app.route("/api/call-token")
+def call_token():
+    """Mint a short-lived LiveKit token so the browser can join a room.
+
+    The agent worker uses automatic dispatch, so it joins whatever room the
+    browser creates. Requires LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET
+    in the environment (same .env the agent reads).
+    """
+    url = os.environ.get("LIVEKIT_URL")
+    api_key = os.environ.get("LIVEKIT_API_KEY")
+    api_secret = os.environ.get("LIVEKIT_API_SECRET")
+    if not (url and api_key and api_secret):
+        return jsonify({
+            "ok": False,
+            "error": "LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET not set. "
+                     "Start this app with your .env loaded.",
+        }), 500
+
+    from livekit import api as lk_api
+
+    room = f"checkin-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    token = (
+        lk_api.AccessToken(api_key, api_secret)
+        .with_identity("patient-browser")
+        .with_name("Patient")
+        .with_grants(lk_api.VideoGrants(room_join=True, room=room))
+        .to_jwt()
+    )
+    return jsonify({"ok": True, "url": url, "token": token, "room": room})
 
 
 @app.route("/static/<path:filename>")
