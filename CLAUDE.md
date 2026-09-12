@@ -22,7 +22,24 @@ first rather than editing.
 
 ## Fixed contracts (do not deviate)
 
-[paste the FeatureVector fields, MossQARecord fields, schema.sql column names here]
+`db/schema.sql` tables and columns:
+- `patients(id, name, baseline_call_id, created_at)`
+- `calls(id, patient_id, timestamp, audio_path, transcript_path)`
+- `features(call_id, jitter_local, jitter_rap, shimmer_local, shimmer_apq5, hnr, rpde, dfa, ppe, speech_rate, pause_freq, pause_avg_duration)`
+- `updrs_predictions(call_id, predicted_score, confidence_band, anomaly_flag)`
+
+`db/contracts.py` dataclasses (mirror the tables above field-for-field):
+- `Patient(name, id, baseline_call_id, created_at)`
+- `Call(patient_id, id, timestamp, audio_path, transcript_path)`
+- `FeatureVector(call_id, jitter_local, jitter_rap, shimmer_local, shimmer_apq5, hnr, rpde, dfa, ppe, speech_rate, pause_freq, pause_avg_duration)`
+- `UPDRSPrediction(call_id, predicted_score, confidence_band, anomaly_flag)`
+- `MossQARecord(patient_id, call_id, question_id, question_topic, answer_text, timestamp, extra)` — Moss-only, not persisted to SQLite
+
+`db/moss_client.py` functions (all `async def` — the real Moss SDK is async-only):
+- `ingest_qa_record(record: MossQARecord) -> None`
+- `query_patient_history(patient_id, query_text, question_topic=None, top_k=5) -> list[MossQARecord]`
+- `push_patient_session(patient_id: int) -> None` — persists a patient's session to the cloud at end of call
+- Backed by one `moss.SessionIndex` per patient (`f"patient:{patient_id}"`), via `MOSS_PROJECT_ID`/`MOSS_PROJECT_KEY`
 
 ## Current stub behavior
 
@@ -33,5 +50,6 @@ implementation changes.
 
 ## Branch discipline
 
-Work happens on `voice-agent` or `ml-pipeline` branches, not directly on
-`main`. Do not merge branches automatically — flag when a PR is ready.
+Work happens on `voice-agent` (Zone A) or `development` (Zone B), not
+directly on `main`. Do not merge branches automatically — flag when a PR is
+ready.
