@@ -57,17 +57,50 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", "", text).strip().lower()
 
 
+# Accepted alternatives for answers that have more than one correct wording.
+# Without these a patient saying "autumn" when we expect "fall" is marked
+# wrong and gets an unnecessary follow-up — a false alarm that wastes the
+# patient's time and pollutes the flags a clinician sees.
+_ANSWER_SYNONYMS: dict[str, set[str]] = {
+    "fall": {"fall", "autumn"},
+    "autumn": {"fall", "autumn"},
+}
+
+# Negations: "I had toast, NOT eggs" contains "eggs", so a plain substring
+# check would score it correct. If the expected answer only appears negated,
+# treat it as a miss.
+_NEGATORS = ("not", "no", "never", "didnt", "didn t", "dont", "don t", "wasnt", "isnt")
+
+
+def _mentions_expected(answer: str, expected: str) -> bool:
+    """Is `expected` (or an accepted synonym) genuinely present, not negated?"""
+    candidates = _ANSWER_SYNONYMS.get(expected, {expected})
+    for cand in candidates:
+        match = _phrase_pattern(cand).search(answer)
+        if not match:
+            continue
+        # Look at the few words immediately before the match for a negator.
+        preceding = answer[: match.start()].split()[-3:]
+        if any(tok in _NEGATORS for tok in preceding):
+            continue  # present, but negated — keep looking
+        return True
+    return False
+
+
 def check_wrong_answer(answer_text: str, expected_answer: Optional[str]) -> TriggerResult:
     """Deterministic check: does this answer contradict a known expected
     value? Used for RECALL_CHECK prompts — orientation questions (expected
     answer computed dynamically, see call_script.orientation_expected_answer)
     and the personal-recall question (expected answer from the patient's
     baseline call).
+
+    Accepts synonyms and rejects negated mentions, so ordinary phrasing
+    ("autumn" for "fall", "not eggs" for "eggs") isn't mis-scored.
     """
     if expected_answer is None:
         return TriggerResult(fired=False)
 
-    if _normalize(expected_answer) not in _normalize(answer_text):
+    if not _mentions_expected(_normalize(answer_text), _normalize(expected_answer)):
         return TriggerResult(
             fired=True,
             reason=f"answer did not match expected value: {expected_answer!r}",

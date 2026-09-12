@@ -80,10 +80,12 @@ NO_ANSWER_TIMEOUT_S = float(os.environ.get("NO_ANSWER_TIMEOUT_S", "12"))
 
 # Hardcoded single test patient/call — priority-1 round-trip proof. Replace
 # with real patient lookup once multi-patient flow is needed.
-TEST_PATIENT_ID = 1
-TEST_CALL_ID = 1
-TEST_PATIENT_NAME = "Test Patient"
-TEST_BASELINE_BREAKFAST_ANSWER = "eggs"  # stands in for a baseline-call lookup
+# Who gets called and under which call id is now resolved at runtime — see
+# resolve_patient() and start_call_row(). PATIENT_ID pins a specific patient;
+# otherwise the most recent signup is called.
+FALLBACK_PATIENT_NAME = "Test Patient"  # only used if the patients table is empty
+# Stands in for a real baseline-call lookup for the personal-recall question.
+BASELINE_BREAKFAST_ANSWER = os.environ.get("BASELINE_BREAKFAST_ANSWER", "eggs")
 
 
 def _now_iso() -> str:
@@ -370,24 +372,68 @@ class CallRecorder:
         logger.info("call %s recorded: %s, %s", self.call_id, self.audio_path, self.transcript_path)
 
 
-def _record_call_row(db_path: str, call_id: int, patient_id: int, audio_path: str, transcript_path: str) -> None:
-    """Insert/update this call's row using the existing schema (read-only
-    use of db/schema.sql — does not modify it)."""
+def _connect_db(db_path: str) -> sqlite3.Connection:
+    """Open the call database, applying db/schema.sql (read-only use — this
+    never modifies the shared schema file)."""
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     schema_sql = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
     conn = sqlite3.connect(db_path)
+    conn.executescript(schema_sql.read_text())
+    return conn
+
+
+def resolve_patient(db_path: str = DB_PATH) -> tuple[int, str]:
+    """Decide who this call is for.
+
+    PATIENT_ID wins if set; otherwise the most recently signed-up patient
+    (so a patient registered through /signup actually gets called); otherwise
+    a test patient is created so the agent still runs on an empty database.
+    """
+    conn = _connect_db(db_path)
     try:
-        conn.executescript(schema_sql.read_text())
-        conn.execute(
-            "INSERT OR IGNORE INTO patients (id, name) VALUES (?, ?)",
-            (patient_id, TEST_PATIENT_NAME),
+        forced = os.environ.get("PATIENT_ID")
+        if forced:
+            row = conn.execute("SELECT id, name FROM patients WHERE id = ?", (int(forced),)).fetchone()
+            if row:
+                return int(row[0]), row[1]
+            logger.warning("PATIENT_ID=%s not found in %s; falling back", forced, db_path)
+
+        row = conn.execute("SELECT id, name FROM patients ORDER BY id DESC LIMIT 1").fetchone()
+        if row:
+            return int(row[0]), row[1]
+
+        cur = conn.execute("INSERT INTO patients (name) VALUES (?)", (FALLBACK_PATIENT_NAME,))
+        conn.commit()
+        return int(cur.lastrowid), FALLBACK_PATIENT_NAME
+    finally:
+        conn.close()
+
+
+def start_call_row(patient_id: int, db_path: str = DB_PATH) -> int:
+    """Create this call's row up front and return its id.
+
+    Allocating a fresh id per call (instead of a hardcoded one) is what keeps
+    repeat calls from overwriting each other's audio, transcript and row.
+    """
+    conn = _connect_db(db_path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO calls (patient_id, timestamp) VALUES (?, ?)",
+            (patient_id, _now_iso()),
         )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def _record_call_row(db_path: str, call_id: int, patient_id: int, audio_path: str, transcript_path: str) -> None:
+    """Attach the recorded artefacts to the call row created at call start."""
+    conn = _connect_db(db_path)
+    try:
         conn.execute(
-            """
-            INSERT INTO calls (id, patient_id, timestamp, audio_path, transcript_path)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET audio_path=excluded.audio_path, transcript_path=excluded.transcript_path
-            """,
-            (call_id, patient_id, _now_iso(), audio_path, transcript_path),
+            "UPDATE calls SET audio_path = ?, transcript_path = ? WHERE id = ?",
+            (audio_path, transcript_path, call_id),
         )
         conn.commit()
     finally:
@@ -405,13 +451,17 @@ async def dry_run() -> None:
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    patient_id, patient_name = resolve_patient()
+    call_id = start_call_row(patient_id)
+    print(f"[dry-run] patient {patient_id} ({patient_name}), call {call_id}\n")
+
     script = CallScript()
     ctx = TurnContext(
-        patient_id=TEST_PATIENT_ID,
-        call_id=TEST_CALL_ID,
-        expected_answers={"recall_check:2": TEST_BASELINE_BREAKFAST_ANSWER},
+        patient_id=patient_id,
+        call_id=call_id,
+        expected_answers={"recall_check:2": BASELINE_BREAKFAST_ANSWER},
     )
-    recorder = CallRecorder(TEST_CALL_ID, TEST_PATIENT_ID)
+    recorder = CallRecorder(call_id, patient_id)
 
     async def speak(text: str) -> None:
         print(f"AGENT: {text}")
@@ -524,13 +574,19 @@ async def entrypoint(ctx) -> None:
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     await ctx.wait_for_participant()
 
+    # Resolved per call, off the main loop (sqlite is blocking): who we're
+    # calling, and a fresh call id so repeat calls don't overwrite each other.
+    patient_id, patient_name = await asyncio.to_thread(resolve_patient)
+    call_id = await asyncio.to_thread(start_call_row, patient_id)
+    logger.info("starting call %s for patient %s (%s)", call_id, patient_id, patient_name)
+
     script = CallScript()
     turn_ctx = TurnContext(
-        patient_id=TEST_PATIENT_ID,
-        call_id=TEST_CALL_ID,
-        expected_answers={"recall_check:2": TEST_BASELINE_BREAKFAST_ANSWER},
+        patient_id=patient_id,
+        call_id=call_id,
+        expected_answers={"recall_check:2": BASELINE_BREAKFAST_ANSWER},
     )
-    recorder = CallRecorder(TEST_CALL_ID, TEST_PATIENT_ID)
+    recorder = CallRecorder(call_id, patient_id)
 
     audio_source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
     track = rtc.LocalAudioTrack.create_audio_track("agent-voice", audio_source)
