@@ -376,11 +376,18 @@ def _decode_to_pcm16(compressed_audio: bytes) -> bytes:
 # --- call recording (audio + transcript with word-level timestamps) --------
 
 class CallRecorder:
-    """Writes call audio to <CALLS_DIR>/<call_id>/audio.wav and a transcript
-    (with Deepgram word-level timestamps on patient turns) to
-    <CALLS_DIR>/<call_id>/transcript.json, then records both paths into the
-    `calls` table per db/schema.sql (audio_path, transcript_path) — without
-    modifying db/schema.sql or db/contracts.py.
+    """Records a call to <CALLS_DIR>/<call_id>/:
+
+      patient.wav      the patient's microphone, continuous from the moment
+                       their audio arrives. This is what the ML pipeline
+                       analyses and what calls.audio_path points at.
+      agent.wav        what the agent said (TTS), kept for review only.
+      transcript.json  the turns, with Deepgram word timestamps on patient
+                       turns and each turn's position in patient.wav.
+
+    Kept as two files on purpose. The original recorder wrote only the
+    agent's TTS into a single audio.wav and never captured the patient, so
+    every acoustic feature and UPDRS score described the synthetic voice.
     """
 
     def __init__(self, call_id: int, patient_id: int, calls_dir: Path = CALLS_DIR):
@@ -388,17 +395,39 @@ class CallRecorder:
         self.patient_id = patient_id
         self.call_dir = calls_dir / str(call_id)
         self.call_dir.mkdir(parents=True, exist_ok=True)
-        self.audio_path = self.call_dir / "audio.wav"
+        self.audio_path = self.call_dir / "patient.wav"
+        self.agent_audio_path = self.call_dir / "agent.wav"
         self.transcript_path = self.call_dir / "transcript.json"
         self.turns: list[dict] = []
+        self.patient_samples = 0
+        self._closed = False
 
-        self._wav = wave.open(str(self.audio_path), "wb")
-        self._wav.setnchannels(NUM_CHANNELS)
-        self._wav.setsampwidth(2)  # PCM16
-        self._wav.setframerate(SAMPLE_RATE)
+        self._patient_wav = self._open_wav(self.audio_path)
+        self._agent_wav = self._open_wav(self.agent_audio_path)
 
-    def write_audio_frame(self, pcm16_bytes: bytes) -> None:
-        self._wav.writeframes(pcm16_bytes)
+    @staticmethod
+    def _open_wav(path: Path):
+        w = wave.open(str(path), "wb")
+        w.setnchannels(NUM_CHANNELS)
+        w.setsampwidth(2)  # PCM16
+        w.setframerate(SAMPLE_RATE)
+        return w
+
+    @property
+    def patient_seconds(self) -> float:
+        """Current length of patient.wav — a position marker into the recording."""
+        return self.patient_samples / SAMPLE_RATE
+
+    def write_patient_frame(self, pcm16_bytes: bytes) -> None:
+        if self._closed:
+            return  # a late frame after hang-up; the file is already closed
+        self._patient_wav.writeframes(pcm16_bytes)
+        self.patient_samples += len(pcm16_bytes) // 2
+
+    def write_agent_audio(self, pcm16_bytes: bytes) -> None:
+        if self._closed:
+            return
+        self._agent_wav.writeframes(pcm16_bytes)
 
     def log_patient_turn(self, text: str, word_timestamps: Optional[list] = None) -> None:
         self.turns.append({
@@ -406,20 +435,39 @@ class CallRecorder:
             "text": text,
             "words": word_timestamps or [],
             "timestamp": _now_iso(),
+            "patient_audio_at_s": round(self.patient_seconds, 3),
         })
 
     def log_agent_turn(self, text: str) -> None:
-        self.turns.append({"speaker": "agent", "text": text, "timestamp": _now_iso()})
+        self.turns.append({
+            "speaker": "agent",
+            "text": text,
+            "timestamp": _now_iso(),
+            "patient_audio_at_s": round(self.patient_seconds, 3),
+        })
 
     def finalize(self, db_path: str = DB_PATH) -> None:
-        self._wav.close()
+        if self._closed:
+            return
+        self._closed = True
+        self._patient_wav.close()
+        self._agent_wav.close()
         with open(self.transcript_path, "w") as f:
             json.dump(
-                {"call_id": self.call_id, "patient_id": self.patient_id, "turns": self.turns},
+                {
+                    "call_id": self.call_id,
+                    "patient_id": self.patient_id,
+                    "audio": {"patient": str(self.audio_path), "agent": str(self.agent_audio_path)},
+                    "patient_audio_seconds": round(self.patient_seconds, 3),
+                    "turns": self.turns,
+                },
                 f, indent=2,
             )
         _record_call_row(db_path, self.call_id, self.patient_id, str(self.audio_path), str(self.transcript_path))
-        logger.info("call %s recorded: %s, %s", self.call_id, self.audio_path, self.transcript_path)
+        logger.info(
+            "call %s recorded: %s (%.1fs of patient audio), %s",
+            self.call_id, self.audio_path, self.patient_seconds, self.transcript_path,
+        )
 
 
 def _connect_db(db_path: str) -> sqlite3.Connection:
@@ -566,7 +614,7 @@ async def dry_run() -> None:
     recorder.finalize()
     await push_patient_session(ctx.patient_id)  # persist this patient's Moss session for their next call
     print(f"\nTranscript: {recorder.transcript_path}")
-    print(f"Audio (silent placeholder in dry-run — no real TTS/mic captured): {recorder.audio_path}")
+    print(f"Patient audio (empty in a dry run — there's no microphone): {recorder.audio_path}")
 
 
 # --- live LiveKit entrypoint --------------------------------------------------
@@ -575,11 +623,20 @@ async def dry_run() -> None:
 # current livekit-agents / livekit-plugins-deepgram APIs; verify field/method
 # names against your installed versions once those keys are in place.
 
-async def _forward_audio(track, stt_stream) -> None:
+async def _forward_audio(track, stt_stream, recorder: Optional[CallRecorder] = None) -> None:
+    """Feed the patient's audio to STT *and* to the patient recording.
+
+    This used to push frames to STT only, so the patient's voice was never
+    saved. Frames are requested at SAMPLE_RATE mono (LiveKit resamples
+    natively) so the same frame is valid for both consumers.
+    """
     from livekit import rtc
-    audio_stream = rtc.AudioStream(track)
+    audio_stream = rtc.AudioStream(track, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS)
     async for event in audio_stream:
-        stt_stream.push_frame(event.frame)
+        frame = event.frame
+        if recorder is not None:
+            recorder.write_patient_frame(bytes(frame.data))
+        stt_stream.push_frame(frame)
 
 
 async def _play_pcm16(audio_source, pcm16_bytes: bytes, recorder: Optional[CallRecorder] = None) -> None:
@@ -599,7 +656,7 @@ async def _play_pcm16(audio_source, pcm16_bytes: bytes, recorder: Optional[CallR
         )
         await audio_source.capture_frame(frame)
     if recorder is not None:
-        recorder.write_audio_frame(pcm16_bytes)
+        recorder.write_agent_audio(pcm16_bytes)
 
 
 def _create_stt():
@@ -687,10 +744,29 @@ async def entrypoint(ctx) -> None:
     def _on_room_disconnected(*_args):
         disconnected.set()
 
+    # One patient-audio forwarder at a time: it feeds both STT and the
+    # recording, and two running at once would interleave frames in the WAV.
+    forwarder: dict[str, Optional[asyncio.Task]] = {"task": None}
+
+    def _start_forwarding(track_) -> None:
+        if forwarder["task"] is not None and not forwarder["task"].done():
+            forwarder["task"].cancel()
+        forwarder["task"] = asyncio.create_task(_forward_audio(track_, stt_stream, recorder))
+
     @ctx.room.on("track_subscribed")
     def _on_track_subscribed(track_, *_args):
         if track_.kind == rtc.TrackKind.KIND_AUDIO:
-            asyncio.create_task(_forward_audio(track_, stt_stream))
+            _start_forwarding(track_)
+
+    # The patient's track can already be subscribed by this point: subscribing
+    # starts at connect, and resolving the patient takes a moment. Then
+    # track_subscribed fired before the handler above existed, and STT would
+    # never receive any audio. Pick up an already-subscribed track explicitly.
+    for participant in ctx.room.remote_participants.values():
+        for publication in participant.track_publications.values():
+            if publication.track is not None and publication.track.kind == rtc.TrackKind.KIND_AUDIO:
+                _start_forwarding(publication.track)
+                break
 
     await speak(script.current_prompt())
 
@@ -763,6 +839,8 @@ async def entrypoint(ctx) -> None:
             if not preload_task.done():
                 preload_task.cancel()
             await moss.close()
+        if forwarder["task"] is not None:
+            forwarder["task"].cancel()  # stop writing patient audio before the file closes
         try:
             recorder.finalize()
         except Exception:
