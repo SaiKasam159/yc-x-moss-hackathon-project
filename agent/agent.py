@@ -27,12 +27,15 @@ import json
 import logging
 import os
 import sqlite3
+import time
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from agent.call_script import CallScript, CallState, orientation_expected_answer
+import numpy as np
+
+from agent.call_script import CallScript, CallState, CaptureMode, orientation_expected_answer
 from agent.triggers import TriggerResult, check_symptom_flag, check_wrong_answer
 from db.contracts import MossQARecord
 from agent.moss_worker import MossBridge
@@ -82,6 +85,25 @@ MAX_FOLLOWUPS_PER_QUESTION = int(os.environ.get("MAX_FOLLOWUPS_PER_QUESTION", "2
 # which is not speech and which STT may never emit a final transcript for, and
 # a patient may simply stay silent. Without this the call waits forever.
 NO_ANSWER_TIMEOUT_S = float(os.environ.get("NO_ANSWER_TIMEOUT_S", "12"))
+
+# Sustained "ahh" (#3) is recorded from the microphone, not via STT: wait up
+# to START_TIMEOUT for the patient to begin, stop once they've been silent for
+# END_SILENCE, never record longer than MAX.
+PHONATION_START_TIMEOUT_S = float(os.environ.get("PHONATION_START_TIMEOUT_S", "6"))
+PHONATION_END_SILENCE_S = float(os.environ.get("PHONATION_END_SILENCE_S", "1.2"))
+PHONATION_MAX_S = float(os.environ.get("PHONATION_MAX_S", "20"))
+
+# Turn-taking (#4). Deepgram finalizes on very short pauses, so one spoken
+# answer arrives as several transcripts. Keep listening until the patient has
+# been quiet this long (no new transcript and no voice on the microphone).
+ANSWER_SETTLE_S = float(os.environ.get("ANSWER_SETTLE_S", "1.0"))
+ANSWER_MAX_S = float(os.environ.get("ANSWER_MAX_S", "30"))
+LONG_SPEECH_SETTLE_S = float(os.environ.get("LONG_SPEECH_SETTLE_S", "2.5"))
+LONG_SPEECH_MAX_S = float(os.environ.get("LONG_SPEECH_MAX_S", "60"))
+
+# Microphone level (int16 RMS) that counts as voice. Browser microphones with
+# echo cancellation and auto-gain put speech well above this, room noise below.
+VOICE_RMS_THRESHOLD = float(os.environ.get("VOICE_RMS_THRESHOLD", "400"))
 
 # Who gets called and under which call id is now resolved at runtime — see
 # resolve_patient() and start_call_row(). PATIENT_ID pins a specific patient;
@@ -401,6 +423,12 @@ class CallRecorder:
         self.turns: list[dict] = []
         self.patient_samples = 0
         self._closed = False
+        # Voice activity on the patient's microphone, used for turn-taking and
+        # to time the phonation task. Position (for cutting segments) and
+        # wall-clock (for "how long have they been quiet") are kept separately.
+        self.last_voice_at_s: Optional[float] = None
+        self._last_voice_monotonic: Optional[float] = None
+        self.segments: list[dict] = []
 
         self._patient_wav = self._open_wav(self.audio_path)
         self._agent_wav = self._open_wav(self.agent_audio_path)
@@ -423,6 +451,30 @@ class CallRecorder:
             return  # a late frame after hang-up; the file is already closed
         self._patient_wav.writeframes(pcm16_bytes)
         self.patient_samples += len(pcm16_bytes) // 2
+        samples = np.frombuffer(pcm16_bytes, dtype=np.int16)
+        if samples.size and float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))) >= VOICE_RMS_THRESHOLD:
+            self.last_voice_at_s = self.patient_seconds
+            self._last_voice_monotonic = time.monotonic()
+
+    def seconds_since_voice(self) -> Optional[float]:
+        """Wall-clock seconds since the patient's microphone last carried
+        voice, or None if it never has."""
+        if self._last_voice_monotonic is None:
+            return None
+        return time.monotonic() - self._last_voice_monotonic
+
+    def mark_segment(
+        self, name: str, start_s: float, end_s: float,
+        text: Optional[str] = None, words: Optional[list] = None,
+    ) -> None:
+        """Mark a stretch of patient.wav to be cut out for the ML pipeline."""
+        self.segments.append({
+            "name": name,
+            "start_s": round(start_s, 3),
+            "end_s": round(end_s, 3),
+            "text": text,
+            "words": words or [],
+        })
 
     def write_agent_audio(self, pcm16_bytes: bytes) -> None:
         if self._closed:
@@ -452,6 +504,7 @@ class CallRecorder:
         self._closed = True
         self._patient_wav.close()
         self._agent_wav.close()
+        self._cut_segments()
         with open(self.transcript_path, "w") as f:
             json.dump(
                 {
@@ -459,15 +512,42 @@ class CallRecorder:
                     "patient_id": self.patient_id,
                     "audio": {"patient": str(self.audio_path), "agent": str(self.agent_audio_path)},
                     "patient_audio_seconds": round(self.patient_seconds, 3),
+                    "segments": self.segments,
                     "turns": self.turns,
                 },
                 f, indent=2,
             )
+
         _record_call_row(db_path, self.call_id, self.patient_id, str(self.audio_path), str(self.transcript_path))
         logger.info(
-            "call %s recorded: %s (%.1fs of patient audio), %s",
-            self.call_id, self.audio_path, self.patient_seconds, self.transcript_path,
+            "call %s recorded: %s (%.1fs of patient audio, %d segment(s)), %s",
+            self.call_id, self.audio_path, self.patient_seconds, len(self.segments), self.transcript_path,
         )
+
+    def _cut_segments(self) -> None:
+        """Write each marked segment to segments/<name>.wav from patient.wav."""
+        if not self.segments:
+            return
+        seg_dir = self.call_dir / "segments"
+        seg_dir.mkdir(exist_ok=True)
+        seen: dict[str, int] = {}
+        with wave.open(str(self.audio_path), "rb") as src:
+            total = src.getnframes()
+            for seg in self.segments:
+                a = max(0, min(total, int(seg["start_s"] * SAMPLE_RATE)))
+                b = max(a, min(total, int(seg["end_s"] * SAMPLE_RATE)))
+                if b - a < int(0.25 * SAMPLE_RATE):
+                    seg["path"], seg["skipped"] = None, "shorter than 0.25s"
+                    continue
+                n = seen.get(seg["name"], 0)
+                seen[seg["name"]] = n + 1
+                out = seg_dir / (f"{seg['name']}.wav" if n == 0 else f"{seg['name']}_{n + 1}.wav")
+                src.setpos(a)
+                w = self._open_wav(out)
+                w.writeframes(src.readframes(b - a))
+                w.close()
+                seg["path"] = str(out)
+                seg["duration_s"] = round((b - a) / SAMPLE_RATE, 3)
 
 
 def _connect_db(db_path: str) -> sqlite3.Connection:
@@ -671,9 +751,173 @@ def _create_stt():
         model="nova-2",
         language="en-US",
         punctuate=True,
-        smart_format=True,
+        # Off on purpose. Smart formatting rewrites spoken words into
+        # "readable" text, which destroys the counting task: on a live call it
+        # turned "one two three ... ten" into "+1 (234) 567-8910" — 3 tokens
+        # instead of 10 words, and a wrong speech rate. The features need the
+        # words as spoken.
+        smart_format=False,
         interim_results=True,
+        # The plugin default is 25ms of silence, which splits ordinary speech
+        # into many fragments. 300ms still ends a turn quickly; the Listener
+        # merges whatever fragments remain.
+        endpointing_ms=300,
     )
+
+
+# --- listening: turning the STT stream into complete answers ----------------
+
+@dataclass
+class Utterance:
+    text: str
+    words: list[dict]
+
+
+def _word_dicts(alt) -> list[dict]:
+    """Deepgram words as plain dicts. In livekit-agents >=1.x they're
+    TimedString — a str subclass carrying start_time/end_time, with no
+    `.word` attribute; the word itself IS the string."""
+    return [
+        {"word": str(w), "start": getattr(w, "start_time", None), "end": getattr(w, "end_time", None)}
+        for w in (getattr(alt, "words", None) or [])
+    ]
+
+
+def _trim_to_words(start_s: float, end_s: float, words: list[dict], pad_s: float = 0.3) -> tuple[float, float]:
+    """Narrow a segment to where the words actually are, dropping the lead-in
+    silence before the patient starts (which would skew pause features).
+    Word times are positions in the audio sent to STT — the same frames that
+    go into patient.wav — but if they don't line up with the markers, the
+    markers are kept rather than trusting them."""
+    times = [(w["start"], w["end"]) for w in words
+             if isinstance(w.get("start"), (int, float)) and isinstance(w.get("end"), (int, float))]
+    if not times:
+        return start_s, end_s
+    first, last = min(t[0] for t in times), max(t[1] for t in times)
+    if first < start_s - 1.0 or last > end_s + 1.0:
+        return start_s, end_s
+    return max(start_s, first - pad_s), min(end_s, last + pad_s)
+
+
+class Listener:
+    """Collects the patient's final transcripts in the background and hands
+    them out as complete answers.
+
+    Replaces awaiting the STT stream directly under a timeout. That cancelled
+    the stream's __anext__ on every timeout, and took each Deepgram final as
+    a whole answer — but Deepgram finalizes on very short pauses, so a
+    sentence arrives in pieces and only its first fragment was scored.
+    """
+
+    def __init__(self, stt_stream, recorder: "CallRecorder", disconnected: asyncio.Event):
+        self._finals: asyncio.Queue[Utterance] = asyncio.Queue()
+        self._recorder = recorder
+        self._disconnected = disconnected
+        self._task = asyncio.create_task(self._pump(stt_stream))
+
+    async def _pump(self, stt_stream) -> None:
+        from livekit.agents import stt as lk_stt
+        async for event in stt_stream:
+            if event.type != lk_stt.SpeechEventType.FINAL_TRANSCRIPT:
+                continue
+            alt = event.alternatives[0]
+            if alt.text and alt.text.strip():
+                await self._finals.put(Utterance(alt.text.strip(), _word_dicts(alt)))
+
+    def discard_pending(self) -> int:
+        """Drop transcripts nobody asked for (e.g. "ahh" fragments during the
+        phonation task) so they aren't read as the next answer."""
+        dropped = 0
+        while not self._finals.empty():
+            self._finals.get_nowait()
+            dropped += 1
+        return dropped
+
+    async def _next(self, timeout: float) -> Optional[Utterance]:
+        """The next final transcript, or None on timeout or hang-up."""
+        if self._disconnected.is_set():
+            return None
+        get = asyncio.ensure_future(self._finals.get())
+        hang_up = asyncio.ensure_future(self._disconnected.wait())
+        done, _ = await asyncio.wait({get, hang_up}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        hang_up.cancel()
+        if get in done:
+            return get.result()
+        get.cancel()  # safe: a cancelled Queue.get leaves any item in the queue
+        return None
+
+    async def answer(
+        self, first_timeout: float, settle_s: float, max_s: float,
+    ) -> tuple[Optional[Utterance], float, float]:
+        """Wait for the patient to start, then keep collecting until they've
+        been quiet for `settle_s` or `max_s` passes.
+
+        Returns (utterance or None, start, end) — positions in patient.wav.
+        """
+        loop = asyncio.get_running_loop()
+        start_s = self._recorder.patient_seconds
+        first = await self._next(first_timeout)
+        if first is None:
+            return None, start_s, self._recorder.patient_seconds
+
+        parts = [first]
+        deadline = loop.time() + max_s
+        voiced_waits = 0
+        while loop.time() < deadline and not self._disconnected.is_set():
+            more = await self._next(min(settle_s, max(0.05, deadline - loop.time())))
+            if more is not None:
+                parts.append(more)
+                voiced_waits = 0
+                continue
+            since_voice = self._recorder.seconds_since_voice()
+            # Voice still on the mic but no transcript yet: STT lags speech,
+            # so give it a couple more windows. Capped, so a noisy room can't
+            # hold every answer open until max_s.
+            if since_voice is not None and since_voice < settle_s and voiced_waits < 2:
+                voiced_waits += 1
+                continue
+            break
+
+        return (
+            Utterance(" ".join(p.text for p in parts), [w for p in parts for w in p.words]),
+            start_s,
+            self._recorder.patient_seconds,
+        )
+
+    async def close(self) -> None:
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+
+
+async def _record_phonation(
+    recorder: "CallRecorder", listener: Listener, disconnected: asyncio.Event,
+) -> tuple[float, float, bool]:
+    """Record the sustained "ahh" from the microphone.
+
+    STT produces no transcript for a sustained vowel (confirmed on a live
+    call: a 4-second vowel yielded none), so this stage used to wait out the
+    no-answer timeout and capture nothing. Now: wait for voicing to begin,
+    record until the patient has been silent for PHONATION_END_SILENCE_S,
+    capped at PHONATION_MAX_S. Returns (start, end, voice_detected).
+    """
+    loop = asyncio.get_running_loop()
+    start_s = recorder.patient_seconds
+    t0 = loop.time()
+    voiced = False
+    while not disconnected.is_set():
+        elapsed = loop.time() - t0
+        if recorder.last_voice_at_s is not None and recorder.last_voice_at_s > start_s:
+            voiced = True
+            since = recorder.seconds_since_voice()
+            if since is not None and since >= PHONATION_END_SILENCE_S:
+                break
+        elif elapsed >= PHONATION_START_TIMEOUT_S:
+            break
+        if elapsed >= PHONATION_MAX_S:
+            break
+        await asyncio.sleep(0.1)
+    listener.discard_pending()
+    return start_s, recorder.patient_seconds, voiced
 
 
 async def _start_moss_and_preload(moss: MossBridge, patient_id: int) -> None:
@@ -692,7 +936,6 @@ async def _start_moss_and_preload(moss: MossBridge, patient_id: int) -> None:
 async def entrypoint(ctx) -> None:
     from livekit import rtc
     from livekit.agents import AutoSubscribe
-    from livekit.agents import stt as lk_stt
 
     if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         raise RuntimeError("LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET not set — see .env.example")
@@ -776,59 +1019,68 @@ async def entrypoint(ctx) -> None:
     # completed 5-stage call loses the transcript entirely (the audio survives,
     # since wave writes incrementally, but every word and timestamp is gone),
     # which is exactly the data the ML pipeline needs.
-    stt_iter = stt_stream.__aiter__()
+    listener = Listener(stt_stream, recorder, disconnected)
+
+    async def move_on() -> bool:
+        """Advance to the next prompt and say it; False once the call is over."""
+        next_prompt = script.advance()
+        if script.is_complete():
+            await speak("That's everything for today — thanks for checking in!")
+            return False
+        await speak(next_prompt)
+        return True
+
     try:
         while not script.is_complete():
             if disconnected.is_set():
                 logger.info("participant left — ending call %s", turn_ctx.call_id)
                 break
 
-            try:
-                event = await asyncio.wait_for(
-                    stt_iter.__anext__(), timeout=NO_ANSWER_TIMEOUT_S
-                )
-            except asyncio.TimeoutError:
-                # No transcript arrived. Either a non-speech task (the "ahhh"
-                # phonation stage never produces one) or a silent patient —
-                # either way, keep the call moving instead of hanging.
-                logger.info(
-                    "no transcript within %ss on %s — advancing",
-                    NO_ANSWER_TIMEOUT_S, script.current_question_id(),
-                )
-                next_prompt = script.advance()
-                if script.is_complete():
-                    await speak("That's everything for today — thanks for checking in!")
-                    break
-                await speak(next_prompt)
-                continue
-            except StopAsyncIteration:
-                break
+            qid = script.current_question_id()
+            mode = script.capture_mode()
 
-            if event.type != lk_stt.SpeechEventType.FINAL_TRANSCRIPT:
+            if mode is CaptureMode.TIMED_AUDIO:
+                # #3: the sustained vowel isn't speech, so record it from the
+                # microphone instead of waiting for a transcript that never comes.
+                start_s, end_s, voiced = await _record_phonation(recorder, listener, disconnected)
+                recorder.mark_segment(script.segment_name() or qid, start_s, end_s)
+                logger.info("%s: recorded %.1fs of patient audio (voice detected: %s)",
+                            qid, end_s - start_s, voiced)
+                if not await move_on():
+                    break
                 continue
-            alt = event.alternatives[0]
-            answer_text = alt.text
-            # livekit-agents >=1.x gives words as TimedString: a str subclass
-            # carrying start_time/end_time. There is no `.word` attribute — the
-            # word itself IS the string, so str(w) is the text.
-            word_timestamps = [
-                {
-                    "word": str(w),
-                    "start": getattr(w, "start_time", None),
-                    "end": getattr(w, "end_time", None),
-                }
-                for w in (getattr(alt, "words", None) or [])
-            ]
-            recorder.log_patient_turn(answer_text, word_timestamps)
+
+            if mode is CaptureMode.LONG_SPEECH:
+                settle_s, max_s = LONG_SPEECH_SETTLE_S, LONG_SPEECH_MAX_S
+            else:
+                settle_s, max_s = ANSWER_SETTLE_S, ANSWER_MAX_S
+
+            utterance, start_s, end_s = await listener.answer(NO_ANSWER_TIMEOUT_S, settle_s, max_s)
+            if utterance is None:
+                if disconnected.is_set():
+                    break
+                # A silent patient: keep the call moving instead of hanging.
+                logger.info("no answer within %ss on %s — advancing", NO_ANSWER_TIMEOUT_S, qid)
+                if not await move_on():
+                    break
+                continue
+
+            recorder.log_patient_turn(utterance.text, utterance.words)
+            if mode is CaptureMode.LONG_SPEECH and script.segment_name():
+                # #4: keep the reading/counting audio and its words together,
+                # trimmed to the speech, for speech-rate and pause features.
+                seg_start, seg_end = _trim_to_words(start_s, end_s, utterance.words)
+                recorder.mark_segment(script.segment_name(), seg_start, seg_end,
+                                      utterance.text, utterance.words)
 
             outcome = await handle_turn(
-                script, turn_ctx, answer_text, speak=speak, word_timestamps=word_timestamps
+                script, turn_ctx, utterance.text, speak=speak, word_timestamps=utterance.words
             )
             await speak(outcome.reply_text)
-
             if script.is_complete():
                 break
     finally:
+        await listener.close()
         try:
             # Answers are saved in the background during the call; give the
             # last few a chance to land before the job exits.

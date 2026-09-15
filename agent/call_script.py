@@ -24,6 +24,31 @@ class CallState(Enum):
     COMPLETE = auto()
 
 
+class CaptureMode(Enum):
+    """How the agent listens during a stage."""
+    ANSWER = auto()       # one spoken answer per prompt; triggers may follow up
+    TIMED_AUDIO = auto()  # not speech: record the microphone, don't wait for a transcript
+    LONG_SPEECH = auto()  # extended speech: keep collecting until the patient stops
+
+
+CAPTURE_MODES: dict[CallState, CaptureMode] = {
+    CallState.RECALL_CHECK: CaptureMode.ANSWER,
+    CallState.SUSTAINED_PHONATION: CaptureMode.TIMED_AUDIO,
+    CallState.READING_TASK: CaptureMode.LONG_SPEECH,
+    CallState.OPEN_QA: CaptureMode.ANSWER,
+    CallState.COUNTING_TASK: CaptureMode.LONG_SPEECH,
+}
+
+# Stretches of patient.wav cut out for the ML pipeline: the phonation segment
+# feeds jitter/shimmer/HNR/RPDE/DFA/PPE; reading and counting feed speech rate
+# and pause features.
+SEGMENT_NAMES: dict[CallState, str] = {
+    CallState.SUSTAINED_PHONATION: "phonation",
+    CallState.READING_TASK: "reading",
+    CallState.COUNTING_TASK: "counting",
+}
+
+
 # A short, original passage (not a copyrighted clinical instrument like the
 # Rainbow Passage) — swap for a licensed one later if desired.
 READING_PASSAGE = (
@@ -104,6 +129,12 @@ class CallScript:
 
     def is_complete(self) -> bool:
         return self.state == CallState.COMPLETE
+
+    def capture_mode(self) -> CaptureMode:
+        return CAPTURE_MODES.get(self.state, CaptureMode.ANSWER)
+
+    def segment_name(self) -> Optional[str]:
+        return SEGMENT_NAMES.get(self.state)
 
     def advance(self) -> Optional[str]:
         """Move to the next prompt — either the next prompt within the
