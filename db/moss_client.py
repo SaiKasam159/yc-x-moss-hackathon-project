@@ -69,6 +69,37 @@ def _get_client():
     return _client
 
 
+def warm_up_client() -> None:
+    """Import the moss SDK and build the client ahead of time.
+
+    Both are synchronous and slow (the SDK wraps a native core). Done lazily
+    inside the first ingest/query, they ran on the agent's event loop mid-call
+    and froze it for ~3s ("event loop blocked for 3124ms"). Call this from a
+    worker prewarm hook or a thread instead. Safe to call more than once.
+    """
+    if STUB_MODE:
+        return
+    import moss  # noqa: F401  (import cost paid here, not mid-call)
+
+    _get_client()
+
+
+async def preload_patient(patient_id: int) -> None:
+    """Load a patient's index into memory before they need it, so the first
+    mid-call retrieval is a local lookup instead of a multi-second load."""
+    if STUB_MODE:
+        return
+    client = _get_client()
+    name = _index_name(patient_id)
+    if patient_id not in _known_indexes:
+        if not await _index_exists(client, name):
+            return  # new patient — nothing to preload yet
+        _known_indexes.add(patient_id)
+    if patient_id not in _loaded_indexes:
+        await client.load_index(name)
+        _loaded_indexes.add(patient_id)
+
+
 async def _index_exists(client, name: str) -> bool:
     try:
         await client.get_index(name)
@@ -124,7 +155,12 @@ async def ingest_qa_record(record: MossQARecord) -> None:
         await client.create_index(name, [doc], model_id="moss-minilm")
         _known_indexes.add(record.patient_id)
 
-    _loaded_indexes.discard(record.patient_id)  # stale after a write; reload before next query
+    # Deliberately NOT invalidating the loaded index here. Invalidating after
+    # every write forced a full load_index() (~2.5s) before every mid-call
+    # query, because the agent writes after every answer. The loaded copy
+    # holds the patient's previous calls, which is what retrieval is for;
+    # answers from the current call are passed to the LLM directly by the
+    # agent (see TurnContext.call_history), so nothing is lost.
 
 
 async def query_patient_history(

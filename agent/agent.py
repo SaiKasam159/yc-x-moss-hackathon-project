@@ -35,7 +35,8 @@ from typing import Awaitable, Callable, Optional
 from agent.call_script import CallScript, CallState, orientation_expected_answer
 from agent.triggers import TriggerResult, check_symptom_flag, check_wrong_answer
 from db.contracts import MossQARecord
-from db.moss_client import ingest_qa_record, push_patient_session, query_patient_history
+from agent.moss_worker import MossBridge
+from db.moss_client import push_patient_session
 
 logger = logging.getLogger("agent")
 
@@ -61,8 +62,16 @@ DB_PATH = os.environ.get("DB_PATH", "data/app.db")
 
 # No dead air: if retrieval + LLM follow-up generation takes longer than
 # this, speak the bridging phrase first, then the real follow-up once ready.
+# The LLM alone takes ~2s median (0.95-3.5s measured), so the bridge fires
+# on most follow-ups. It must therefore be an acknowledgement, not a question:
+# the old "Can you tell me a bit more about that?" was immediately followed
+# by the real follow-up question, so patients heard two questions in a row.
 FALLBACK_TIMEOUT_S = float(os.environ.get("FALLBACK_TIMEOUT_S", "1.2"))
-FALLBACK_PHRASE = "Can you tell me a bit more about that?"
+FALLBACK_PHRASE = "Okay, thank you for telling me."
+# Used only when no follow-up can be generated at all (no key / LLM error).
+TEMPLATED_FOLLOWUP = "Can you say a little more about that? I want to make sure I understand."
+# Longest we'll wait on a Moss lookup before asking the follow-up without history.
+RETRIEVAL_TIMEOUT_S = float(os.environ.get("RETRIEVAL_TIMEOUT_S", "3"))
 
 # Most follow-ups to ask about any single question before moving on, so a
 # repeatedly-tripped trigger can't trap the call on one question.
@@ -101,6 +110,20 @@ class TurnContext:
     # answer the follow-up), which means a patient who keeps tripping the
     # check would loop on one question forever. See MAX_FOLLOWUPS_PER_QUESTION.
     followup_counts: dict[str, int] = field(default_factory=dict)
+    # This call's answers so far. Moss holds previous calls; these are handed
+    # to the LLM directly so a follow-up can also reference earlier in *this*
+    # call without waiting for (or re-loading) the index.
+    call_history: list[MossQARecord] = field(default_factory=list)
+    # Moss access. Live calls pass a bridge that runs Moss in child processes
+    # (see agent/moss_worker.py); the in-process default suits tests.
+    moss: MossBridge = field(default_factory=lambda: MossBridge(isolated=False))
+
+    def save_in_background(self, record: MossQARecord) -> None:
+        self.moss.save(record)
+
+    async def flush_writes(self, timeout: float = 20.0) -> None:
+        """Wait for outstanding Moss writes so the last answers aren't lost."""
+        await self.moss.flush(timeout)
 
 
 @dataclass
@@ -122,14 +145,24 @@ async def _retrieve_and_generate_followup(
     script: CallScript, ctx: TurnContext, record: MossQARecord, trigger: TriggerResult
 ) -> str:
     """The Moss retrieval + LLM follow-up step that runs when a trigger
-    fires. moss_client's real SessionIndex.query() runs in-memory (no
-    network round trip) so this stays fast enough for mid-call latency."""
-    context_records = await query_patient_history(
-        patient_id=ctx.patient_id,
-        query_text=trigger.query_text or record.answer_text,
-        question_topic=record.question_topic,
-    )
-    return await generate_followup_llm(trigger, context_records)
+    fires. The patient's index is preloaded at call start, so the query is a
+    local lookup; this call's earlier answers come straight from memory."""
+    try:
+        past_calls = await asyncio.wait_for(
+            ctx.moss.query(
+                patient_id=ctx.patient_id,
+                query_text=trigger.query_text or record.answer_text,
+                question_topic=record.question_topic,
+            ),
+            timeout=RETRIEVAL_TIMEOUT_S,
+        )
+    except Exception:
+        # A slow or failed lookup must not stall the call: ask the follow-up
+        # without history rather than not at all.
+        logger.warning("Moss lookup failed or timed out; following up without history", exc_info=True)
+        past_calls = []
+    this_call = [r for r in ctx.call_history if r is not record]
+    return await generate_followup_llm(trigger, past_calls, this_call)
 
 
 async def speak_with_fallback(
@@ -175,7 +208,12 @@ async def handle_turn(
         timestamp=_now_iso(),
         extra={"word_timestamps": word_timestamps} if word_timestamps else {},
     )
-    await ingest_qa_record(record)
+    # Save in the background. Awaiting this put a 3-5s Moss write between
+    # every answer and the agent's reply (measured 5.8-7.7s of silence per
+    # turn). The reply never depends on this write: retrieval reads previous
+    # calls, and this call's answers are kept in call_history.
+    ctx.save_in_background(record)
+    ctx.call_history.append(record)
 
     trigger: TriggerResult = TriggerResult(fired=False)
     if script.state == CallState.RECALL_CHECK:
@@ -223,18 +261,26 @@ def _get_llm_client():
     return _llm_client
 
 
-async def generate_followup_llm(trigger: TriggerResult, context_records: list[MossQARecord]) -> str:
+async def generate_followup_llm(
+    trigger: TriggerResult,
+    context_records: list[MossQARecord],
+    this_call: Optional[list[MossQARecord]] = None,
+) -> str:
     """Generate one short, informed follow-up question using retrieved Moss
-    context. Degrades to a templated question (no network call) when
-    OPENAI_API_KEY isn't set, so the whole loop stays runnable without an
-    LLM key — same spirit as db/moss_client.py's STUB_MODE.
+    context (previous calls) plus this call's earlier answers. Degrades to a
+    templated question (no network call) when OPENAI_API_KEY isn't set, so
+    the whole loop stays runnable without an LLM key.
     """
-    context_lines = [f"- ({r.timestamp}) {r.answer_text}" for r in context_records]
-    context_str = "\n".join(context_lines) or "(no related prior answers on file)"
+    past_lines = [f"- ({r.timestamp[:10]}) {r.answer_text}" for r in context_records]
+    now_lines = [f"- {r.answer_text}" for r in (this_call or [])]
+    context_str = (
+        "From previous calls:\n" + ("\n".join(past_lines) or "(none on file)")
+        + "\n\nEarlier in this call:\n" + ("\n".join(now_lines) or "(nothing yet)")
+    )
 
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY not set — using templated follow-up instead of a real LLM call.")
-        return "Can you say more about that? I want to make sure I understand what you meant."
+        return TEMPLATED_FOLLOWUP
 
     system = (
         "You are a warm, brief phone check-in assistant for a Parkinson's "
@@ -256,11 +302,11 @@ async def generate_followup_llm(trigger: TriggerResult, context_records: list[Mo
                 },
             ],
         )
-        return (response.choices[0].message.content or "").strip() or FALLBACK_PHRASE
+        return (response.choices[0].message.content or "").strip() or TEMPLATED_FOLLOWUP
     except Exception:
         # Never let an LLM outage drop the call — fall back to a safe line.
         logger.warning("LLM follow-up generation failed; using templated follow-up", exc_info=True)
-        return "Can you say more about that? I want to make sure I understand what you meant."
+        return TEMPLATED_FOLLOWUP
 
 
 # --- TTS ---------------------------------------------------------------------
@@ -458,12 +504,16 @@ async def dry_run() -> None:
     patient_id, patient_name = resolve_patient()
     call_id = start_call_row(patient_id)
     print(f"[dry-run] patient {patient_id} ({patient_name}), call {call_id}\n")
+    moss = MossBridge()
+    await moss.start()
+    await moss.preload(patient_id)
 
     script = CallScript()
     ctx = TurnContext(
         patient_id=patient_id,
         call_id=call_id,
         expected_answers={"recall_check:2": BASELINE_BREAKFAST_ANSWER},
+        moss=moss,
     )
     recorder = CallRecorder(call_id, patient_id)
 
@@ -511,6 +561,8 @@ async def dry_run() -> None:
     else:
         print(f"[dry-run] hit max_turns={max_turns} safety cap without completing — check for a trigger loop.")
 
+    await ctx.flush_writes()
+    await moss.close()
     recorder.finalize()
     await push_patient_session(ctx.patient_id)  # persist this patient's Moss session for their next call
     print(f"\nTranscript: {recorder.transcript_path}")
@@ -567,6 +619,19 @@ def _create_stt():
     )
 
 
+async def _start_moss_and_preload(moss: MossBridge, patient_id: int) -> None:
+    """Start the Moss child processes and load the patient's history.
+
+    Failures are logged, not raised: a call without history is still a call.
+    Writes queued before start finishes simply wait for it.
+    """
+    try:
+        await moss.start()
+        await moss.preload(patient_id)
+    except Exception:
+        logger.warning("Moss start/preload failed; call continues without history", exc_info=True)
+
+
 async def entrypoint(ctx) -> None:
     from livekit import rtc
     from livekit.agents import AutoSubscribe
@@ -583,12 +648,18 @@ async def entrypoint(ctx) -> None:
     patient_id, patient_name = await asyncio.to_thread(resolve_patient)
     call_id = await asyncio.to_thread(start_call_row, patient_id)
     logger.info("starting call %s for patient %s (%s)", call_id, patient_id, patient_name)
+    # Moss runs in its own processes so its native core can't freeze this
+    # call's audio (see agent/moss_worker.py). Start them and load this
+    # patient's history while the agent says its first line.
+    moss = MossBridge()
+    preload_task = asyncio.create_task(_start_moss_and_preload(moss, patient_id))
 
     script = CallScript()
     turn_ctx = TurnContext(
         patient_id=patient_id,
         call_id=call_id,
         expected_answers={"recall_check:2": BASELINE_BREAKFAST_ANSWER},
+        moss=moss,
     )
     recorder = CallRecorder(call_id, patient_id)
 
@@ -683,6 +754,16 @@ async def entrypoint(ctx) -> None:
                 break
     finally:
         try:
+            # Answers are saved in the background during the call; give the
+            # last few a chance to land before the job exits.
+            await turn_ctx.flush_writes()
+        except Exception:
+            logger.exception("failed waiting for Moss writes on call %s", turn_ctx.call_id)
+        finally:
+            if not preload_task.done():
+                preload_task.cancel()
+            await moss.close()
+        try:
             recorder.finalize()
         except Exception:
             logger.exception("failed to finalize call recording for call %s", turn_ctx.call_id)
@@ -693,9 +774,26 @@ async def entrypoint(ctx) -> None:
             logger.exception("failed to push Moss session for patient %s", turn_ctx.patient_id)
 
 
+def prewarm(proc) -> None:
+    """Runs once per worker process, before it takes any call.
+
+    Pays the slow, synchronous start-up costs (native SDK imports, client
+    construction) here instead of on the first call's event loop, where they
+    froze audio for seconds.
+    """
+    import av  # noqa: F401
+    import edge_tts  # noqa: F401
+    from livekit.plugins import deepgram  # noqa: F401
+
+    # Moss is deliberately not imported here: it runs in child processes
+    # (agent/moss_worker.py) so its native core can't freeze calls.
+    if OPENAI_API_KEY:
+        _get_llm_client()
+
+
 def run_worker() -> None:
     from livekit.agents import WorkerOptions, cli
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
 
 
 if __name__ == "__main__":
