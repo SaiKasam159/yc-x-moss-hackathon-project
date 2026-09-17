@@ -118,6 +118,34 @@ def check_wrong_answer(
     )
 
 
+def check_word_recall(
+    answer_text: str,
+    words: Iterable[str],
+    min_required: int = 2,
+) -> TriggerResult:
+    """Delayed recall: how many of the words said earlier come back?
+
+    This has a correct answer the agent actually knows, because it chose the
+    words — unlike "what did you have for breakfast?", which it replaced.
+
+    Fires when fewer than `min_required` are recalled. One miss out of three
+    is common in healthy older adults, so flagging every miss would be noise;
+    the count is reported either way for tracking over time.
+    """
+    words = list(words)
+    answer = _normalize(answer_text)
+    recalled = [w for w in words if _phrase_pattern(_normalize(w)).search(answer)]
+    summary = f"recalled {len(recalled)} of {len(words)} words"
+    if len(recalled) >= min_required:
+        return TriggerResult(fired=False, reason=summary)
+    missed = [w for w in words if w not in recalled]
+    return TriggerResult(
+        fired=True,
+        reason=f"{summary} (missed: {', '.join(missed)})",
+        query_text=answer_text,
+    )
+
+
 def check_symptom_flag(answer_text: str) -> TriggerResult:
     """Semantic check: does this free-form answer mention a flagged symptom?
 

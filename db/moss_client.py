@@ -136,24 +136,40 @@ async def ingest_qa_record(record: MossQARecord) -> None:
     for the rest of the call (and future calls — every write here is already
     persisted to the cloud, no separate push step needed).
     """
+    await ingest_qa_records([record])
+
+
+async def ingest_qa_records(records: list[MossQARecord]) -> None:
+    """Write several QA turns in one go.
+
+    Each Moss round trip costs 3-5s regardless of how many documents it
+    carries, so writing one answer at a time left a ten-turn call with ~30s
+    of writes still outstanding when it ended — and the last few were lost
+    when the call shut down. One call per patient, many documents.
+    """
+    if not records:
+        return
     if STUB_MODE:
-        _stub_store.append(record)
+        _stub_store.extend(records)
         return
 
     from moss import MutationOptions
 
-    client = _get_client()
-    name = _index_name(record.patient_id)
-    doc = await _to_document(record)
+    by_patient: dict[int, list] = {}
+    for record in records:
+        by_patient.setdefault(record.patient_id, []).append(await _to_document(record))
 
-    if record.patient_id in _known_indexes or await _index_exists(client, name):
-        _known_indexes.add(record.patient_id)
-        await client.add_docs(name, [doc], MutationOptions(upsert=True))
-    else:
-        # Brand-new patient — create_index() (not session()) so the model is
-        # set correctly; see module docstring for why session() is avoided.
-        await client.create_index(name, [doc], model_id="moss-minilm")
-        _known_indexes.add(record.patient_id)
+    client = _get_client()
+    for patient_id, docs in by_patient.items():
+        name = _index_name(patient_id)
+        if patient_id in _known_indexes or await _index_exists(client, name):
+            _known_indexes.add(patient_id)
+            await client.add_docs(name, docs, MutationOptions(upsert=True))
+        else:
+            # Brand-new patient — create_index() (not session()) so the model
+            # is set correctly; see module docstring for why session() is avoided.
+            await client.create_index(name, docs, model_id="moss-minilm")
+            _known_indexes.add(patient_id)
 
     # Deliberately NOT invalidating the loaded index here. Invalidating after
     # every write forced a full load_index() (~2.5s) before every mid-call

@@ -22,6 +22,7 @@ class CallState(Enum):
     READING_TASK = auto()          # read a fixed passage — speech rate / pause features
     OPEN_QA = auto()               # free-form check-in questions — symptom-flag trigger surface
     COUNTING_TASK = auto()         # "count from 1 to 20" — pause/rhythm features
+    DELAYED_RECALL = auto()        # the three words from the start of the call
     COMPLETE = auto()
 
 
@@ -38,6 +39,7 @@ CAPTURE_MODES: dict[CallState, CaptureMode] = {
     CallState.READING_TASK: CaptureMode.LONG_SPEECH,
     CallState.OPEN_QA: CaptureMode.ANSWER,
     CallState.COUNTING_TASK: CaptureMode.LONG_SPEECH,
+    CallState.DELAYED_RECALL: CaptureMode.ANSWER,
 }
 
 # Stretches of patient.wav cut out for the ML pipeline: the phonation segment
@@ -48,6 +50,24 @@ SEGMENT_NAMES: dict[CallState, str] = {
     CallState.READING_TASK: "reading",
     CallState.COUNTING_TASK: "counting",
 }
+
+
+# Three unrelated everyday words, said early in the call and asked for again
+# at the end. This replaced "what did you have for breakfast?", which looked
+# like a memory check but wasn't: breakfast changes daily, so no baseline
+# answer can be right, and anyone who ate something different was flagged.
+# These the agent chooses, so it knows the correct answer.
+RECALL_WORD_LISTS: tuple[tuple[str, str, str], ...] = (
+    ("apple", "table", "penny"),
+    ("carrot", "window", "river"),
+    ("book", "garden", "silver"),
+    ("lemon", "chair", "cloud"),
+)
+
+
+def recall_words_for_call(call_id: int) -> tuple[str, str, str]:
+    """Rotate the list per call so a patient doesn't simply learn one set."""
+    return RECALL_WORD_LISTS[call_id % len(RECALL_WORD_LISTS)]
 
 
 # A short, original passage (not a copyrighted clinical instrument like the
@@ -62,7 +82,9 @@ STATE_PROMPTS: dict[CallState, list[str]] = {
     CallState.RECALL_CHECK: [
         "What day of the week is it today?",           # orientation — dynamic expected answer
         "What season is it right now?",                # orientation — dynamic expected answer
-        "What did you have for breakfast this morning?",  # personal recall — baseline-derived expected answer
+        # Registration for the delayed recall at the end of the call.
+        "I'm going to say three words, and I'll ask you for them again later: "
+        "{words}. Can you repeat them back to me now?",
     ],
     CallState.SUSTAINED_PHONATION: [
         "Take a deep breath and say 'ahh' for as long as you comfortably can.",
@@ -77,6 +99,9 @@ STATE_PROMPTS: dict[CallState, list[str]] = {
     CallState.COUNTING_TASK: [
         "Please count out loud from one to twenty.",
     ],
+    CallState.DELAYED_RECALL: [
+        "Earlier I asked you to remember three words. Can you tell me what they were?",
+    ],
     CallState.COMPLETE: [],
 }
 
@@ -86,6 +111,7 @@ _ORDER = [
     CallState.READING_TASK,
     CallState.OPEN_QA,
     CallState.COUNTING_TASK,
+    CallState.DELAYED_RECALL,
     CallState.COMPLETE,
 ]
 
@@ -206,13 +232,15 @@ class CallScript:
     state: CallState = CallState.RECALL_CHECK
     prompt_index: int = 0
     turn_count: int = 0
+    # The words this call asks the patient to remember (see recall_words_for_call).
+    recall_words: tuple[str, ...] = RECALL_WORD_LISTS[0]
 
     def current_prompt(self) -> Optional[str]:
         """The prompt to say right now, or None if the call is complete."""
         prompts = STATE_PROMPTS[self.state]
         if self.prompt_index >= len(prompts):
             return None
-        return prompts[self.prompt_index]
+        return prompts[self.prompt_index].format(words=", ".join(self.recall_words))
 
     def current_question_id(self) -> str:
         return f"{self.state.name.lower()}:{self.prompt_index}"

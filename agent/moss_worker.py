@@ -65,6 +65,8 @@ async def _serve() -> None:
             result: Any = None
             if op == "ingest":
                 await moss_client.ingest_qa_record(MossQARecord(**args["record"]))
+            elif op == "ingest_many":
+                await moss_client.ingest_qa_records([MossQARecord(**r) for r in args["records"]])
             elif op == "query":
                 records = await moss_client.query_patient_history(**args)
                 result = [dataclasses.asdict(r) for r in records]
@@ -183,11 +185,19 @@ class MossBridge:
     Moss in child processes; isolated=False calls db.moss_client directly.
     """
 
-    def __init__(self, isolated: Optional[bool] = None):
+    def __init__(self, isolated: Optional[bool] = None,
+                 batch_window_s: float = 0.25, batch_max: int = 25):
         self.isolated = (not moss_client.STUB_MODE) if isolated is None else isolated
         self._writer = _Child("writer") if self.isolated else None
         self._reader = _Child("reader") if self.isolated else None
         self._pending: set[asyncio.Task] = set()
+        # Answers wait briefly here so several go out in one write. A Moss
+        # round trip costs 3-5s whatever it carries, so writing one answer at
+        # a time left a whole call's worth of writes unfinished at hang-up.
+        self._outbox: list[MossQARecord] = []
+        self._batch_window_s = batch_window_s
+        self._batch_max = batch_max
+        self._flusher: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         if self.isolated:
@@ -195,21 +205,41 @@ class MossBridge:
 
     def save(self, record: MossQARecord) -> None:
         """Queue a write and return immediately; failures are logged."""
-        task = asyncio.create_task(self._ingest(record))
+        self._outbox.append(record)
+        self._ensure_flusher()
+
+    def _ensure_flusher(self) -> None:
+        if self._flusher is not None and not self._flusher.done():
+            return
+        task = asyncio.create_task(self._drain_outbox())
+        self._flusher = task
         self._pending.add(task)
 
         def _done(t: asyncio.Task) -> None:
             self._pending.discard(t)
             if not t.cancelled() and t.exception() is not None:
-                logger.warning("Moss write failed for %s: %s", record.question_id, t.exception())
+                logger.warning("Moss write batch failed: %s", t.exception())
 
         task.add_done_callback(_done)
 
-    async def _ingest(self, record: MossQARecord) -> None:
+    async def _drain_outbox(self) -> None:
+        await asyncio.sleep(self._batch_window_s)  # let a few answers accumulate
+        while self._outbox:
+            batch = self._outbox[: self._batch_max]
+            del self._outbox[: len(batch)]
+            try:
+                await self._ingest_many(batch)
+            except Exception as exc:
+                logger.warning("Moss write failed for %s: %s",
+                               ", ".join(r.question_id for r in batch), exc)
+
+    async def _ingest_many(self, records: list[MossQARecord]) -> None:
         if self.isolated:
-            await self._writer.request("ingest", {"record": dataclasses.asdict(record)})
+            await self._writer.request(
+                "ingest_many", {"records": [dataclasses.asdict(r) for r in records]}
+            )
         else:
-            await moss_client.ingest_qa_record(record)
+            await moss_client.ingest_qa_records(records)
 
     async def query(
         self,
@@ -231,8 +261,10 @@ class MossBridge:
         else:
             await moss_client.preload_patient(patient_id)
 
-    async def flush(self, timeout: float = 20.0) -> None:
+    async def flush(self, timeout: float = 30.0) -> None:
         """Wait for queued writes so the last answers of a call aren't lost."""
+        if self._outbox:
+            self._ensure_flusher()
         if not self._pending:
             return
         _, still_pending = await asyncio.wait(set(self._pending), timeout=timeout)

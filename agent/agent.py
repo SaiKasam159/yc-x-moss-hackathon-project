@@ -35,8 +35,15 @@ from typing import Awaitable, Callable, Optional
 
 import numpy as np
 
-from agent.call_script import CallScript, CallState, CaptureMode, orientation_expected_answer
-from agent.triggers import TriggerResult, check_symptom_flag, check_wrong_answer
+from agent.call_script import (
+    CallScript,
+    CallState,
+    CaptureMode,
+    orientation_expected_answer,
+    patient_now,
+    recall_words_for_call,
+)
+from agent.triggers import TriggerResult, check_symptom_flag, check_word_recall, check_wrong_answer
 from db.contracts import MossQARecord
 from agent.moss_worker import MossBridge
 from db.moss_client import push_patient_session
@@ -109,8 +116,6 @@ VOICE_RMS_THRESHOLD = float(os.environ.get("VOICE_RMS_THRESHOLD", "400"))
 # resolve_patient() and start_call_row(). PATIENT_ID pins a specific patient;
 # otherwise the most recent signup is called.
 FALLBACK_PATIENT_NAME = "Test Patient"  # only used if the patients table is empty
-# Stands in for a real baseline-call lookup for the personal-recall question.
-BASELINE_BREAKFAST_ANSWER = os.environ.get("BASELINE_BREAKFAST_ANSWER", "eggs")
 
 
 def _now_iso() -> str:
@@ -186,7 +191,11 @@ async def _retrieve_and_generate_followup(
         logger.warning("Moss lookup failed or timed out; following up without history", exc_info=True)
         past_calls = []
     this_call = [r for r in ctx.call_history if r is not record]
-    return await generate_followup_llm(trigger, past_calls, this_call)
+    return await generate_followup_llm(
+        trigger, past_calls, this_call,
+        question=script.current_prompt(),
+        answer=record.answer_text,
+    )
 
 
 async def speak_with_fallback(
@@ -232,18 +241,32 @@ async def handle_turn(
         timestamp=_now_iso(),
         extra={"word_timestamps": word_timestamps} if word_timestamps else {},
     )
-    # Save in the background. Awaiting this put a 3-5s Moss write between
-    # every answer and the agent's reply (measured 5.8-7.7s of silence per
-    # turn). The reply never depends on this write: retrieval reads previous
-    # calls, and this call's answers are kept in call_history.
-    ctx.save_in_background(record)
-    ctx.call_history.append(record)
-
     trigger: TriggerResult = TriggerResult(fired=False)
     if script.state == CallState.RECALL_CHECK:
-        trigger = check_wrong_answer(answer_text, _resolve_expected_answer(script, ctx))
+        expected = _resolve_expected_answer(script, ctx)
+        if expected is not None:
+            trigger = check_wrong_answer(answer_text, expected)
+        else:
+            # The word-registration prompt. Repeating words back is attention,
+            # not memory — the memory check is DELAYED_RECALL at the end — so
+            # note the count but don't interrupt the call over it.
+            repeated = check_word_recall(answer_text, script.recall_words, min_required=0)
+            record.extra["words_repeated"] = repeated.reason
+            logger.info("%s: registration — %s", record.question_id, repeated.reason)
+    elif script.state == CallState.DELAYED_RECALL:
+        trigger = check_word_recall(answer_text, script.recall_words)
+        record.extra["delayed_recall"] = trigger.reason
+        logger.info("%s: %s", record.question_id, trigger.reason)
     elif script.state == CallState.OPEN_QA:
         trigger = check_symptom_flag(answer_text)
+
+    # Save in the background, after the checks above have annotated the
+    # record. Awaiting the write put a 3-5s Moss call between every answer and
+    # the agent's reply (measured 5.8-7.7s of silence per turn). The reply
+    # never depends on it: retrieval reads previous calls, and this call's
+    # answers are kept in call_history.
+    ctx.save_in_background(record)
+    ctx.call_history.append(record)
 
     qid = record.question_id
     already_followed_up = ctx.followup_counts.get(qid, 0)
@@ -289,6 +312,8 @@ async def generate_followup_llm(
     trigger: TriggerResult,
     context_records: list[MossQARecord],
     this_call: Optional[list[MossQARecord]] = None,
+    question: Optional[str] = None,
+    answer: Optional[str] = None,
 ) -> str:
     """Generate one short, informed follow-up question using retrieved Moss
     context (previous calls) plus this call's earlier answers. Degrades to a
@@ -306,12 +331,21 @@ async def generate_followup_llm(
         logger.warning("OPENAI_API_KEY not set — using templated follow-up instead of a real LLM call.")
         return TEMPLATED_FOLLOWUP
 
+    # The model must be told what was actually just asked. Without it, it
+    # picked whatever stood out in the retrieved history: after a patient
+    # failed the word-recall it asked about their hands, because a tremor was
+    # mentioned earlier in the call.
     system = (
-        "You are a warm, brief phone check-in assistant for a Parkinson's "
-        f"patient. A trigger fired during the call: {trigger.reason}. "
-        "Using the retrieved context below, ask ONE short, natural, "
-        "non-alarming follow-up question. Do not diagnose or give medical "
-        "advice. One sentence only."
+        "You are a warm, brief phone check-in assistant for a Parkinson's patient.\n"
+        f"You just asked: {question or '(unknown)'}\n"
+        f"They answered: {answer or '(unknown)'}\n"
+        f"That was flagged because: {trigger.reason}\n\n"
+        "Ask ONE short, natural, non-alarming follow-up that stays on THIS "
+        "question — do not change the subject to something else in the "
+        "history. If they couldn't recall the words, you may offer a gentle "
+        "cue (such as what kind of thing one of them is) but never say the "
+        "words themselves. Use the history only to make the question more "
+        "specific. Do not diagnose or give medical advice. One sentence."
     )
     try:
         client = _get_llm_client()
@@ -666,11 +700,11 @@ async def dry_run() -> None:
     await moss.start()
     await moss.preload(patient_id)
 
-    script = CallScript()
+    script = CallScript(recall_words=recall_words_for_call(call_id))
     ctx = TurnContext(
         patient_id=patient_id,
         call_id=call_id,
-        expected_answers={"recall_check:2": BASELINE_BREAKFAST_ANSWER},
+        timezone=patient.timezone,
         moss=moss,
     )
     recorder = CallRecorder(call_id, patient_id)
@@ -684,15 +718,17 @@ async def dry_run() -> None:
     # so the follow-up round the agent asks actually gets resolved instead
     # of re-triggering on the same wrong answer forever. Everything else is
     # a single plausible "correct" answer.
+    words = script.recall_words
     scripted_answers: dict[str, list[str]] = {
-        "recall_check:0": [datetime.date.today().strftime("%A")],          # correct — no trigger
+        "recall_check:0": [patient_now(ctx.timezone).strftime("%A")],           # correct — no trigger
         "recall_check:1": ["definitely not a season", "sorry, I meant fall"],   # WRONG, then corrected — triggers once
-        "recall_check:2": ["I had toast, not eggs", "oh you're right, I had eggs"],  # WRONG vs baseline — triggers once
+        "recall_check:2": [", ".join(words)],                                   # repeats the words back
         "sustained_phonation:0": ["ahhhhh"],
         "reading_task:0": ["The old dog stretched slowly..."],
         "open_qa:0": ["I've been okay, but my hands have had a bit of a tremor lately.", "it's mild, comes and goes"],  # triggers symptom flag once
         "open_qa:1": ["Nothing major otherwise."],
-        "counting_task:0": ["1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20"],
+        "counting_task:0": ["one two three four five six seven eight nine ten"],
+        "delayed_recall:0": [words[0], f"{words[0]} and {words[1]}"],           # 1 of 3 -> flags, then 2 of 3 -> clears
     }
     answer_iters = {qid: iter(answers) for qid, answers in scripted_answers.items()}
 
@@ -988,11 +1024,11 @@ async def entrypoint(ctx) -> None:
     moss = MossBridge()
     preload_task = asyncio.create_task(_start_moss_and_preload(moss, patient_id))
 
-    script = CallScript()
+    script = CallScript(recall_words=recall_words_for_call(call_id))
     turn_ctx = TurnContext(
         patient_id=patient_id,
         call_id=call_id,
-        expected_answers={"recall_check:2": BASELINE_BREAKFAST_ANSWER},
+        timezone=patient.timezone,
         moss=moss,
     )
     recorder = CallRecorder(call_id, patient_id)
