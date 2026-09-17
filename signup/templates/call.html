@@ -163,10 +163,20 @@
           endBtn.hidden = true;
         });
 
-        // Transcriptions, if the agent publishes them.
-        room.on(LivekitClient.RoomEvent.TranscriptionReceived, (segments, participant) => {
-          const who = participant && participant.identity === "patient-browser" ? "You" : "Agent";
-          segments.filter((s) => s.final).forEach((s) => addLine(who, s.text));
+        // Live transcript. The agent publishes one data message per line on
+        // the "transcript" topic; the previous TranscriptionReceived listener
+        // never fired because nothing emitted those events.
+        room.on(LivekitClient.RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+          // Older/newer client versions pass either loose args or a packet.
+          const bytes = payload && payload.data ? payload.data : payload;
+          const onTopic = topic || (payload && payload.topic);
+          if (onTopic && onTopic !== "transcript") return;
+          try {
+            const msg = JSON.parse(new TextDecoder().decode(bytes));
+            addLine(msg.speaker === "patient" ? "You" : "Agent", msg.text);
+          } catch (err) {
+            console.warn("unreadable transcript message", err);
+          }
         });
 
         await room.connect(data.url, data.token);

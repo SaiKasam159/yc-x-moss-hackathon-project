@@ -108,6 +108,9 @@ ANSWER_MAX_S = float(os.environ.get("ANSWER_MAX_S", "30"))
 LONG_SPEECH_SETTLE_S = float(os.environ.get("LONG_SPEECH_SETTLE_S", "2.5"))
 LONG_SPEECH_MAX_S = float(os.environ.get("LONG_SPEECH_MAX_S", "60"))
 
+# Data-message topic the call page listens on for the live transcript.
+TRANSCRIPT_TOPIC = os.environ.get("TRANSCRIPT_TOPIC", "transcript")
+
 # Microphone level (int16 RMS) that counts as voice. Browser microphones with
 # echo cancellation and auto-gain put speech well above this, room noise below.
 VOICE_RMS_THRESHOLD = float(os.environ.get("VOICE_RMS_THRESHOLD", "400"))
@@ -1008,6 +1011,24 @@ async def _record_phonation(
     return start_s, recorder.patient_seconds, voiced
 
 
+async def _publish_transcript_line(room, speaker: str, text: str) -> None:
+    """Send one transcript line to whoever has the call page open.
+
+    The page was listening for LiveKit transcription events, which this agent
+    never emits, so its transcript panel stayed empty for the whole call.
+    Failures are swallowed on purpose: a display feed must never break a call.
+    """
+    if not text:
+        return
+    try:
+        payload = json.dumps({"speaker": speaker, "text": text, "at": _now_iso()})
+        await room.local_participant.publish_data(
+            payload.encode(), topic=TRANSCRIPT_TOPIC, reliable=True
+        )
+    except Exception:
+        logger.debug("could not publish transcript line", exc_info=True)
+
+
 async def _start_moss_and_preload(moss: MossBridge, patient_id: int) -> None:
     """Start the Moss child processes and load the patient's history.
 
@@ -1061,6 +1082,8 @@ async def entrypoint(ctx) -> None:
 
     async def speak(text: str) -> None:
         pcm = await synthesize_speech(text)
+        # Publish before playing so the line appears as the agent starts talking.
+        await _publish_transcript_line(ctx.room, "agent", text)
         await _play_pcm16(audio_source, pcm, recorder=recorder)
         recorder.log_agent_turn(text)
 
@@ -1158,6 +1181,7 @@ async def entrypoint(ctx) -> None:
                 continue
 
             recorder.log_patient_turn(utterance.text, utterance.words)
+            await _publish_transcript_line(ctx.room, "patient", utterance.text)
             if mode is CaptureMode.LONG_SPEECH and script.segment_name():
                 # #4: keep the reading/counting audio and its words together,
                 # trimmed to the speech, for speech-rate and pause features.
