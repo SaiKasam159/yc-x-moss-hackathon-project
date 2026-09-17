@@ -616,6 +616,28 @@ def _patient_timezone(conn, patient_id: int) -> Optional[str]:
         return None
 
 
+def _requested_patient_id(participant) -> Optional[int]:
+    """Which patient the caller asked for, taken from the participant
+    metadata on their token ({"patient_id": 3}) — set by the call page's
+    picker. None if absent or malformed, in which case resolve_patient falls
+    back to its usual order."""
+    raw = getattr(participant, "metadata", None)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw).get("patient_id")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        logger.warning("participant metadata isn't JSON, ignoring it: %r", str(raw)[:100])
+        return None
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("participant metadata patient_id isn't a number: %r", value)
+        return None
+
+
 def resolve_patient(db_path: str = DB_PATH, patient_id: Optional[int] = None) -> PatientRef:
     """Decide who this call is for.
 
@@ -1007,11 +1029,11 @@ async def entrypoint(ctx) -> None:
         raise RuntimeError("LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET not set — see .env.example")
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    await ctx.wait_for_participant()
+    participant = await ctx.wait_for_participant()
 
     # Resolved per call, off the main loop (sqlite is blocking): who we're
     # calling, and a fresh call id so repeat calls don't overwrite each other.
-    patient = await asyncio.to_thread(resolve_patient)
+    patient = await asyncio.to_thread(resolve_patient, DB_PATH, _requested_patient_id(participant))
     patient_id = patient.id
     call_id = await asyncio.to_thread(start_call_row, patient_id)
     logger.info(

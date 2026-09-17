@@ -129,6 +129,31 @@ def call_page():
     return send_from_directory(BASE_DIR / "templates", "call.html")
 
 
+@app.route("/api/patients")
+def list_patients():
+    """Patients the call page can choose between, newest signup first."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT p.id, p.name,
+                   (SELECT d.timezone FROM patient_signup_details d
+                     WHERE d.patient_id = p.id ORDER BY d.id DESC LIMIT 1) AS timezone,
+                   (SELECT MAX(c.timestamp) FROM calls c WHERE c.patient_id = p.id) AS last_call
+              FROM patients p
+             ORDER BY p.id DESC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return jsonify({
+        "ok": True,
+        "patients": [
+            {"id": r[0], "name": r[1], "timezone": r[2], "last_call": r[3]} for r in rows
+        ],
+    })
+
+
 @app.route("/api/call-token")
 def call_token():
     """Mint a short-lived LiveKit token so the browser can join a room.
@@ -149,15 +174,35 @@ def call_token():
 
     from livekit import api as lk_api
 
+    # Which patient this call is for. Without it the agent just calls whoever
+    # signed up last, so there was no way to call anyone else.
+    patient_id = request.args.get("patient_id", type=int)
+    patient_name = None
+    if patient_id is not None:
+        conn = get_db()
+        try:
+            row = conn.execute("SELECT name FROM patients WHERE id = ?", (patient_id,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return jsonify({"ok": False, "error": f"No patient with id {patient_id}."}), 404
+        patient_name = row[0]
+
     room = f"checkin-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-    token = (
+    builder = (
         lk_api.AccessToken(api_key, api_secret)
-        .with_identity("patient-browser")
-        .with_name("Patient")
+        .with_identity(f"patient-{patient_id}" if patient_id else "patient-browser")
+        .with_name(patient_name or "Patient")
         .with_grants(lk_api.VideoGrants(room_join=True, room=room))
-        .to_jwt()
     )
-    return jsonify({"ok": True, "url": url, "token": token, "room": room})
+    if patient_id is not None:
+        # The agent reads this from the participant to know who it's calling.
+        builder = builder.with_metadata(json.dumps({"patient_id": patient_id}))
+
+    return jsonify({
+        "ok": True, "url": url, "token": builder.to_jwt(), "room": room,
+        "patient_id": patient_id, "patient_name": patient_name,
+    })
 
 
 @app.route("/static/<path:filename>")
