@@ -101,6 +101,12 @@
           opt.textContent = `${p.name} (#${p.id})${tz}${last}`;
           patientSel.appendChild(opt);
         });
+        // ?patient_id=N preselects, so the scheduler's link opens on the
+        // right patient.
+        const wanted = new URLSearchParams(location.search).get("patient_id");
+        if (wanted && patients.some((p) => String(p.id) === String(wanted))) {
+          patientSel.value = wanted;
+        }
       } catch (err) {
         setStatus("Couldn't load the patient list: " + err.message, "error");
       }
