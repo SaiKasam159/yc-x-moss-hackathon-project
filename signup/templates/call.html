@@ -131,6 +131,7 @@
 
     async function startCall() {
       startBtn.disabled = true;
+      let micBlocked = false;
       setStatus("Getting a token…");
       try {
         const chosen = patientSel.value;
@@ -147,7 +148,8 @@
             const el = track.attach();
             el.autoplay = true;
             document.body.appendChild(el);
-            setStatus("Connected — the agent is on the line.", "live");
+            // Don't overwrite a microphone warning with "all good".
+            if (!micBlocked) setStatus("Connected — the agent is on the line.", "live");
           }
         });
 
@@ -186,11 +188,24 @@
         });
 
         await room.connect(data.url, data.token);
-        await room.localParticipant.setMicrophoneEnabled(true);
 
-        setStatus("Connected — waiting for the agent to speak…", "live");
+        // Swap the buttons as soon as we're in the room. Doing this after
+        // enabling the microphone meant a blocked mic left a live call on
+        // screen still offering "Start call" and no way to hang up.
         startBtn.hidden = true;
         endBtn.hidden = false;
+        setStatus("Connected — waiting for the agent to speak…", "live");
+
+        try {
+          await room.localParticipant.setMicrophoneEnabled(true);
+        } catch (micErr) {
+          micBlocked = true;
+          setStatus(
+            "Connected, but your microphone is blocked — you'll hear the agent, " +
+            "but it can't hear you. Allow microphone access and start again.",
+            "error"
+          );
+        }
       } catch (err) {
         setStatus(
           "Couldn't start the call: " + err.message +
