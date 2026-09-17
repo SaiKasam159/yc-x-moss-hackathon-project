@@ -14,7 +14,8 @@ praat-parselmouth
 scikit-learn
 pandas
 numpy
-ucimlrepo                # UCI dataset fetcher
+# ucimlrepo removed: its fetch raises DatasetNotFoundError for this dataset.
+# ml/train_model.py downloads the CSV from the UCI archive directly.
 librosa                  # Audio processing (loading, resampling, spectral features)
 soundfile                # Audio I/O
 webrtcvad                # Voice activity detection

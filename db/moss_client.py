@@ -79,8 +79,9 @@ def warm_up_client() -> None:
     """
     if STUB_MODE:
         return
-    import moss  # noqa: F401  (import cost paid here, not mid-call)
+    import importlib
 
+    importlib.import_module("moss")  # pay the import cost here, not mid-call
     _get_client()
 
 

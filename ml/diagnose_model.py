@@ -7,7 +7,6 @@ Usage:
 
 from __future__ import annotations
 
-import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.model_selection import cross_val_score, train_test_split

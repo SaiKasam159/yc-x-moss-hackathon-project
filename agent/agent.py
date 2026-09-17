@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import importlib
 import io
 import json
 import logging
@@ -724,7 +725,7 @@ def _record_call_row(db_path: str, call_id: int, patient_id: int, audio_path: st
 async def dry_run() -> None:
     """Exercises the full turn-handling loop — call script, both triggers,
     stub Moss retrieval, fallback bridging, LLM step (templated if
-    ANTHROPIC_API_KEY is unset) — with scripted fake patient answers.
+    OPENAI_API_KEY is unset) — with scripted fake patient answers.
     Zero LiveKit/Deepgram/Moss/LLM keys required. This is the "prove the
     pipeline works" check that's actually runnable in this environment.
     """
@@ -1266,9 +1267,9 @@ def prewarm(proc) -> None:
     construction) here instead of on the first call's event loop, where they
     froze audio for seconds.
     """
-    import av  # noqa: F401
-    import edge_tts  # noqa: F401
-    from livekit.plugins import deepgram  # noqa: F401
+    # Imported for the side effect of paying their (slow) import cost here.
+    for module in ("av", "edge_tts", "livekit.plugins.deepgram"):
+        importlib.import_module(module)
 
     # Moss is deliberately not imported here: it runs in child processes
     # (agent/moss_worker.py) so its native core can't freeze calls.
@@ -1282,7 +1283,6 @@ def run_worker() -> None:
 
 
 if __name__ == "__main__":
-    import sys
     if "--dry-run" in sys.argv or len(sys.argv) == 1:
         asyncio.run(dry_run())
     else:
