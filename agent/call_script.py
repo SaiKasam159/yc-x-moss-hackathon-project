@@ -13,6 +13,7 @@ import datetime
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 
 class CallState(Enum):
@@ -95,19 +96,108 @@ _SEASON_BY_MONTH = {
     9: "fall", 10: "fall", 11: "fall",
 }
 
+# Astronomical season starts (approximate; the solstice/equinox moves a day
+# either way between years).
+_ASTRONOMICAL_STARTS = [(3, 20, "spring"), (6, 21, "summer"), (9, 22, "fall"), (12, 21, "winter")]
 
-def orientation_expected_answer(question_id: str, today: Optional[datetime.date] = None) -> Optional[str]:
-    """Dynamically computed expected answers for the orientation-type prompts
-    in RECALL_CHECK (today's day-of-week / season). Returns None for
-    question_ids that aren't orientation questions — e.g. the personal
-    recall prompt, whose expected answer comes from the patient's baseline
-    instead (see agent.py's TurnContext.expected_answers).
+_OPPOSITE_SEASON = {"winter": "summer", "summer": "winter", "spring": "fall", "fall": "spring"}
+
+_ZONE_TAB_PATHS = ("/usr/share/zoneinfo/zone1970.tab", "/usr/share/zoneinfo/zone.tab")
+# Used only if the tz database isn't readable.
+_SOUTHERN_PREFIXES = (
+    "Australia/", "Antarctica/", "Pacific/Auckland", "Pacific/Fiji",
+    "America/Argentina", "America/Sao_Paulo", "America/Santiago", "America/Montevideo",
+    "America/La_Paz", "America/Asuncion", "America/Lima", "Africa/Johannesburg",
+    "Africa/Nairobi", "Africa/Harare", "Indian/",
+)
+_southern_zones: Optional[set[str]] = None
+
+
+def _load_southern_zones() -> Optional[set[str]]:
+    """Zones south of the equator, read from the tz database's coordinates
+    (e.g. "AU\t-3352+15113\tAustralia/Sydney") so this isn't a list someone
+    has to keep up to date."""
+    for path in _ZONE_TAB_PATHS:
+        try:
+            with open(path) as f:
+                zones = set()
+                for line in f:
+                    if line.startswith("#"):
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) < 3:
+                        continue
+                    coords, name = parts[1], parts[2].strip()
+                    if coords[:1] == "-":  # latitude sign
+                        zones.add(name)
+                if zones:
+                    return zones
+        except OSError:
+            continue
+    return None
+
+
+def is_southern_hemisphere(timezone: Optional[str]) -> bool:
+    global _southern_zones
+    if not timezone:
+        return False
+    if _southern_zones is None:
+        _southern_zones = _load_southern_zones() or set()
+    if _southern_zones:
+        return timezone in _southern_zones
+    return timezone.startswith(_SOUTHERN_PREFIXES)
+
+
+def _astronomical_season(today: datetime.date) -> str:
+    season = "winter"
+    for month, day, name in _ASTRONOMICAL_STARTS:
+        if (today.month, today.day) >= (month, day):
+            season = name
+    return season
+
+
+def accepted_seasons(today: datetime.date, timezone: Optional[str] = None) -> set[str]:
+    """Seasons it's reasonable to call today.
+
+    Both the meteorological season (by month) and the astronomical one (by
+    equinox/solstice) are accepted: for two or three weeks each quarter they
+    disagree — on 15 September a patient saying "summer" is as right as one
+    saying "fall" — and marking that wrong flags a healthy patient.
+    Flipped below the equator.
     """
-    today = today or datetime.date.today()
+    seasons = {_SEASON_BY_MONTH[today.month], _astronomical_season(today)}
+    if is_southern_hemisphere(timezone):
+        seasons = {_OPPOSITE_SEASON[s] for s in seasons}
+    return seasons
+
+
+def patient_now(timezone: Optional[str] = None) -> datetime.datetime:
+    """The current time where the patient is, not where the server is."""
+    if timezone:
+        try:
+            return datetime.datetime.now(ZoneInfo(timezone))
+        except Exception:
+            pass  # unknown zone: fall back to the server clock below
+    return datetime.datetime.now()
+
+
+def orientation_expected_answer(
+    question_id: str,
+    today: Optional[datetime.date] = None,
+    timezone: Optional[str] = None,
+) -> Optional[set[str]]:
+    """Accepted answers for the orientation prompts in RECALL_CHECK, or None
+    for prompts that aren't orientation questions.
+
+    Answers are judged in the patient's own timezone. The server clock was
+    wrong for anyone in a different one: a New York patient called at 8pm is
+    already on the next day in the UK, so "what day is it?" was scored wrong.
+    """
+    today = today or patient_now(timezone).date()
     if question_id == "recall_check:0":
-        return today.strftime("%A")
+        return {today.strftime("%A")}
     if question_id == "recall_check:1":
-        return _SEASON_BY_MONTH[today.month]
+        return accepted_seasons(today, timezone)
     return None
 
 

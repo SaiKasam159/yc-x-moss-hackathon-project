@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional, Union
 
 # Category -> surface forms. Keep this small and hand-curated for the demo;
 # swap/extend once real call transcripts show what patients actually say.
@@ -74,7 +74,7 @@ _NEGATORS = ("not", "no", "never", "didnt", "didn t", "dont", "don t", "wasnt", 
 
 def _mentions_expected(answer: str, expected: str) -> bool:
     """Is `expected` (or an accepted synonym) genuinely present, not negated?"""
-    candidates = _ANSWER_SYNONYMS.get(expected, {expected})
+    candidates = set(_ANSWER_SYNONYMS.get(expected, {expected}))
     for cand in candidates:
         match = _phrase_pattern(cand).search(answer)
         if not match:
@@ -87,26 +87,35 @@ def _mentions_expected(answer: str, expected: str) -> bool:
     return False
 
 
-def check_wrong_answer(answer_text: str, expected_answer: Optional[str]) -> TriggerResult:
-    """Deterministic check: does this answer contradict a known expected
-    value? Used for RECALL_CHECK prompts — orientation questions (expected
-    answer computed dynamically, see call_script.orientation_expected_answer)
-    and the personal-recall question (expected answer from the patient's
-    baseline call).
+def check_wrong_answer(
+    answer_text: str,
+    expected_answer: Optional[Union[str, Iterable[str]]],
+) -> TriggerResult:
+    """Deterministic check: does this answer contradict what's expected?
 
-    Accepts synonyms and rejects negated mentions, so ordinary phrasing
-    ("autumn" for "fall", "not eggs" for "eggs") isn't mis-scored.
+    `expected_answer` may be one value or several acceptable ones (e.g. both
+    seasons during the weeks when the meteorological and astronomical ones
+    disagree). Synonyms are accepted and negated mentions rejected, so
+    ordinary phrasing ("autumn" for "fall", "not eggs" for "eggs") isn't
+    mis-scored.
     """
     if expected_answer is None:
         return TriggerResult(fired=False)
 
-    if not _mentions_expected(_normalize(answer_text), _normalize(expected_answer)):
-        return TriggerResult(
-            fired=True,
-            reason=f"answer did not match expected value: {expected_answer!r}",
-            query_text=answer_text,
-        )
-    return TriggerResult(fired=False)
+    accepted = [expected_answer] if isinstance(expected_answer, str) else list(expected_answer)
+    if not accepted:
+        return TriggerResult(fired=False)
+
+    answer = _normalize(answer_text)
+    if any(_mentions_expected(answer, _normalize(exp)) for exp in accepted):
+        return TriggerResult(fired=False)
+
+    expected_str = accepted[0] if len(accepted) == 1 else " or ".join(sorted(accepted))
+    return TriggerResult(
+        fired=True,
+        reason=f"answer did not match expected value: {expected_str!r}",
+        query_text=answer_text,
+    )
 
 
 def check_symptom_flag(answer_text: str) -> TriggerResult:

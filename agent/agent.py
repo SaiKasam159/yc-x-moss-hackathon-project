@@ -127,6 +127,8 @@ class TurnContext:
     # whose expected answer isn't computed dynamically (i.e. personal
     # recall, not orientation — see call_script.orientation_expected_answer).
     expected_answers: dict[str, str] = field(default_factory=dict)
+    # The patient's timezone, so "what day is it?" is judged where they are.
+    timezone: Optional[str] = None
     # question_id -> how many follow-ups we've already asked on it. A fired
     # trigger deliberately does NOT advance the script (so the patient can
     # answer the follow-up), which means a patient who keeps tripping the
@@ -155,9 +157,9 @@ class TurnOutcome:
     used_fallback: bool = False
 
 
-def _resolve_expected_answer(script: CallScript, ctx: TurnContext) -> Optional[str]:
+def _resolve_expected_answer(script: CallScript, ctx: TurnContext):
     qid = script.current_question_id()
-    dynamic = orientation_expected_answer(qid)
+    dynamic = orientation_expected_answer(qid, timezone=ctx.timezone)
     if dynamic is not None:
         return dynamic
     return ctx.expected_answers.get(qid)
@@ -560,29 +562,56 @@ def _connect_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def resolve_patient(db_path: str = DB_PATH) -> tuple[int, str]:
+@dataclass
+class PatientRef:
+    id: int
+    name: str
+    timezone: Optional[str] = None  # from the signup form; used to judge orientation answers
+
+
+def _patient_timezone(conn, patient_id: int) -> Optional[str]:
+    """The patient's timezone from their signup, if they have one. The table
+    belongs to /signup and may not exist on a database the agent created."""
+    try:
+        row = conn.execute(
+            "SELECT timezone FROM patient_signup_details WHERE patient_id = ? ORDER BY id DESC LIMIT 1",
+            (patient_id,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
+    except sqlite3.Error:
+        return None
+
+
+def resolve_patient(db_path: str = DB_PATH, patient_id: Optional[int] = None) -> PatientRef:
     """Decide who this call is for.
 
-    PATIENT_ID wins if set; otherwise the most recently signed-up patient
-    (so a patient registered through /signup actually gets called); otherwise
-    a test patient is created so the agent still runs on an empty database.
+    An explicit patient_id wins (the browser picks one when starting a call),
+    then PATIENT_ID, then the most recently signed-up patient; failing all
+    that a test patient is created so the agent still runs on an empty
+    database.
     """
     conn = _connect_db(db_path)
     try:
-        forced = os.environ.get("PATIENT_ID")
-        if forced:
-            row = conn.execute("SELECT id, name FROM patients WHERE id = ?", (int(forced),)).fetchone()
+        for candidate, source in ((patient_id, "requested"), (os.environ.get("PATIENT_ID"), "PATIENT_ID")):
+            if not candidate:
+                continue
+            try:
+                wanted = int(candidate)
+            except (TypeError, ValueError):
+                logger.warning("%s=%r is not a patient id; ignoring it", source, candidate)
+                continue
+            row = conn.execute("SELECT id, name FROM patients WHERE id = ?", (wanted,)).fetchone()
             if row:
-                return int(row[0]), row[1]
-            logger.warning("PATIENT_ID=%s not found in %s; falling back", forced, db_path)
+                return PatientRef(int(row[0]), row[1], _patient_timezone(conn, int(row[0])))
+            logger.warning("%s=%s not found in %s; falling back", source, wanted, db_path)
 
         row = conn.execute("SELECT id, name FROM patients ORDER BY id DESC LIMIT 1").fetchone()
         if row:
-            return int(row[0]), row[1]
+            return PatientRef(int(row[0]), row[1], _patient_timezone(conn, int(row[0])))
 
         cur = conn.execute("INSERT INTO patients (name) VALUES (?)", (FALLBACK_PATIENT_NAME,))
         conn.commit()
-        return int(cur.lastrowid), FALLBACK_PATIENT_NAME
+        return PatientRef(int(cur.lastrowid), FALLBACK_PATIENT_NAME, None)
     finally:
         conn.close()
 
@@ -629,9 +658,10 @@ async def dry_run() -> None:
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    patient_id, patient_name = resolve_patient()
+    patient = resolve_patient()
+    patient_id = patient.id
     call_id = start_call_row(patient_id)
-    print(f"[dry-run] patient {patient_id} ({patient_name}), call {call_id}\n")
+    print(f"[dry-run] patient {patient_id} ({patient.name}), timezone {patient.timezone}, call {call_id}\n")
     moss = MossBridge()
     await moss.start()
     await moss.preload(patient_id)
@@ -945,9 +975,13 @@ async def entrypoint(ctx) -> None:
 
     # Resolved per call, off the main loop (sqlite is blocking): who we're
     # calling, and a fresh call id so repeat calls don't overwrite each other.
-    patient_id, patient_name = await asyncio.to_thread(resolve_patient)
+    patient = await asyncio.to_thread(resolve_patient)
+    patient_id = patient.id
     call_id = await asyncio.to_thread(start_call_row, patient_id)
-    logger.info("starting call %s for patient %s (%s)", call_id, patient_id, patient_name)
+    logger.info(
+        "starting call %s for patient %s (%s), timezone %s",
+        call_id, patient_id, patient.name, patient.timezone or "unknown (using server clock)",
+    )
     # Moss runs in its own processes so its native core can't freeze this
     # call's audio (see agent/moss_worker.py). Start them and load this
     # patient's history while the agent says its first line.
