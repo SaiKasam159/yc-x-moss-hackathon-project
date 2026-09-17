@@ -17,6 +17,7 @@ script and run a Moss retrieval + follow-up question:
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass
 from typing import Iterable, Optional, Union
@@ -118,6 +119,25 @@ def check_wrong_answer(
     )
 
 
+def _word_was_said(answer: str, word: str) -> bool:
+    """Did the patient say this word, allowing for speech-to-text slips?
+
+    Exact matching punished the transcriber, not the patient: on a live call
+    "book and garden" came back as "Booking garden", scoring 1 of 3 instead
+    of 2 and flagging a memory problem that didn't happen. A recalled word is
+    accepted when a spoken token matches it exactly, starts with it (booking
+    -> book), or is near-identical (penny -> penney).
+    """
+    if _phrase_pattern(word).search(answer):
+        return True
+    for token in answer.split():
+        if len(word) >= 4 and (token.startswith(word) or word.startswith(token) and len(token) >= 4):
+            return True
+        if difflib.SequenceMatcher(None, token, word).ratio() >= 0.85:
+            return True
+    return False
+
+
 def check_word_recall(
     answer_text: str,
     words: Iterable[str],
@@ -134,7 +154,7 @@ def check_word_recall(
     """
     words = list(words)
     answer = _normalize(answer_text)
-    recalled = [w for w in words if _phrase_pattern(_normalize(w)).search(answer)]
+    recalled = [w for w in words if _word_was_said(answer, _normalize(w))]
     summary = f"recalled {len(recalled)} of {len(words)} words"
     if len(recalled) >= min_required:
         return TriggerResult(fired=False, reason=summary)
