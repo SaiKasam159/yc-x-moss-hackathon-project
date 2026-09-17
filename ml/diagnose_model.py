@@ -13,8 +13,11 @@ from sklearn.inspection import permutation_importance
 from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.svm import SVR
 
+from sklearn.model_selection import GroupShuffleSplit
+
 from ml.train_model import (
     FEATURE_COLUMNS,
+    SUBJECT_COLUMN,
     TARGET_COLUMN,
     load_uci_dataset,
 )
@@ -26,14 +29,26 @@ def diagnose():
 
     X = df[FEATURE_COLUMNS]
     y = df[TARGET_COLUMN]
+    groups = df[SUBJECT_COLUMN]
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
+    # Split by patient, not by row. Each person has ~140 recordings, so a
+    # random split puts the same person on both sides and every number below
+    # comes out flattering.
+    train_idx, test_idx = next(
+        GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42).split(X, y, groups)
     )
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+    # The old leaky split, kept to show the difference.
+    Xr_train, Xr_test, yr_train, yr_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    leaky = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1).fit(Xr_train, yr_train)
+    print(f"\n=== Same model, random row split (leaky): test R² = {leaky.score(Xr_test, yr_test):.4f} ===")
 
     print("\n=== Dataset Analysis ===")
-    print(f"Total samples: {len(df)}")
-    print(f"Train/test split: {len(X_train)}/{len(X_test)}")
+    print(f"Total samples: {len(df)} from {groups.nunique()} patients")
+    print(f"Train/test split: {len(X_train)}/{len(X_test)} rows "
+          f"({groups.iloc[train_idx].nunique()}/{groups.iloc[test_idx].nunique()} patients)")
     print(f"Target (UPDRS) range: {y.min():.1f} - {y.max():.1f}, mean={y.mean():.1f}, std={y.std():.1f}")
 
     print("\n=== Feature Statistics ===")
