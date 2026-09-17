@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import datetime
 import json
 import logging
 import math
@@ -123,6 +124,25 @@ def _prosody_features(transcript: dict) -> dict:
     return {"speech_rate": 0.0, "pause_freq": 0.0, "pause_avg_duration": 0.0}
 
 
+def _ensure_call_row(conn: sqlite3.Connection, call_id: int, patient_id: int) -> None:
+    """Make sure the call and its patient exist before writing results.
+
+    The agent creates both when a call starts. Analysing a call whose rows
+    aren't there — a calls/ directory copied to another machine, a rebuilt
+    database — used to fail with a bare "FOREIGN KEY constraint failed"
+    halfway through. The transcript knows who the call belonged to, so
+    rebuild the rows from it and say so.
+    """
+    if conn.execute("SELECT 1 FROM calls WHERE id = ?", (call_id,)).fetchone():
+        return
+    conn.execute("INSERT OR IGNORE INTO patients (id, name) VALUES (?, ?)",
+                 (patient_id, f"Patient {patient_id}"))
+    conn.execute("INSERT INTO calls (id, patient_id, timestamp) VALUES (?, ?, ?)",
+                 (call_id, patient_id, datetime.datetime.utcnow().isoformat() + "Z"))
+    conn.commit()
+    logger.warning("call %s had no database row; rebuilt it from the transcript", call_id)
+
+
 def _save_features(conn: sqlite3.Connection, features: FeatureVector) -> None:
     columns = [f.name for f in dataclasses.fields(FeatureVector)]
     updates = ", ".join(f"{c} = excluded.{c}" for c in columns if c != "call_id")
@@ -196,6 +216,7 @@ def analyse_call(
 
     conn = _connect(db_path)
     try:
+        _ensure_call_row(conn, call_id, patient_id)
         _save_features(conn, features)
         logger.info("call %s: features saved", call_id)
 
