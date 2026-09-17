@@ -26,6 +26,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import math
 import os
 import sqlite3
 from pathlib import Path
@@ -38,6 +39,9 @@ logger = logging.getLogger("agent.post_call")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = os.environ.get("DB_PATH", "data/app.db")
 CALLS_DIR = Path(os.environ.get("CALLS_DIR", "calls"))
+
+# Shorter than this and the vowel isn't worth measuring.
+MIN_PHONATION_SECONDS = float(os.environ.get("MIN_PHONATION_SECONDS", "1.0"))
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -63,19 +67,48 @@ def _segment(transcript: dict, name: str) -> Optional[dict]:
     return None
 
 
-def _acoustic_features(transcript: dict, calls_dir: Path, call_id: int) -> dict:
-    """Jitter/shimmer/HNR/RPDE/DFA/PPE from the sustained vowel."""
+def _acoustic_features(
+    transcript: dict, calls_dir: Path, call_id: int, allow_speech_fallback: bool = False,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Jitter/shimmer/HNR/RPDE/DFA/PPE from the sustained vowel.
+
+    Returns (features, reason_unusable). These measurements only mean anything
+    on a sustained vowel, so a call without one gets no features rather than
+    numbers taken from conversational speech.
+    """
     from ml.audio import extract_acoustic_features, extract_phonation_segment
 
     seg = _segment(transcript, "phonation")
     if seg:
-        return extract_acoustic_features(seg["path"])
+        if (seg.get("duration_s") or 0) < MIN_PHONATION_SECONDS:
+            return None, (f"phonation segment is only {seg.get('duration_s')}s "
+                          f"(need {MIN_PHONATION_SECONDS}s)")
+        return extract_acoustic_features(seg["path"]), None
 
-    # No marked segment (e.g. a call recorded before the phonation stage was
-    # captured properly): fall back to finding the longest voiced stretch.
+    if not allow_speech_fallback:
+        # Measuring ordinary speech as if it were a held vowel produced
+        # nonsense on a hung-up call: jitter 4.6%, HNR 7.7 dB, "UPDRS 29.3".
+        return None, "no phonation segment was recorded (patient didn't hold a vowel)"
+
     patient_wav = transcript.get("audio", {}).get("patient") or str(calls_dir / str(call_id) / "patient.wav")
-    logger.warning("no phonation segment for call %s; falling back to VAD over %s", call_id, patient_wav)
-    return extract_acoustic_features(extract_phonation_segment(patient_wav))
+    logger.warning("call %s: no phonation segment; falling back to VAD over %s "
+                   "— these features come from speech, not a held vowel", call_id, patient_wav)
+    return extract_acoustic_features(extract_phonation_segment(patient_wav)), None
+
+
+def _unusable_reason(acoustic: dict) -> Optional[str]:
+    """Why these numbers can't be trusted, if they can't.
+
+    Silence makes parselmouth return NaN for jitter and shimmer; those NaNs
+    were being written to the database and scored as "high severity".
+    """
+    bad = [k for k, v in acoustic.items() if v is None or not math.isfinite(v)]
+    if bad:
+        return f"no usable voice sample (these came back as not-a-number: {', '.join(sorted(bad))})"
+    if acoustic.get("hnr", 0) <= 0:
+        return (f"no harmonic signal in the recording (HNR {acoustic['hnr']:.1f} dB) — "
+                "silence or noise, not a voice")
+    return None
 
 
 def _prosody_features(transcript: dict) -> dict:
@@ -118,13 +151,44 @@ def _transcript_text(transcript: dict) -> str:
     return "\n".join(f"{t['speaker']}: {t['text']}" for t in transcript.get("turns", []))
 
 
-def analyse_call(call_id: int, db_path: str = DB_PATH, calls_dir: Path = CALLS_DIR) -> dict:
+def _write_unusable_report(
+    call_id: int, patient_id: int, reason: str, flags: list[str], calls_dir: Path
+) -> Path:
+    """A call that produced no measurable voice still gets a report saying so."""
+    lines = [f"Patient {patient_id} | Call {call_id}"]
+    if flags:
+        lines.append("Raised during the call:\n  • " + "\n  • ".join(flags))
+    lines.append(f"No voice measurements from this call: {reason}.")
+    lines.append("No UPDRS estimate is given, because there is nothing to base one on.")
+    path = calls_dir / str(call_id) / "report.txt"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def analyse_call(
+    call_id: int, db_path: str = DB_PATH, calls_dir: Path = CALLS_DIR,
+    allow_speech_fallback: bool = False,
+) -> dict:
     """Analyse one finished call. Returns what it produced, for logging."""
     transcript = _load_transcript(call_id, calls_dir)
     patient_id = transcript["patient_id"]
     flags = [f["reason"] for f in transcript.get("flags", []) if f.get("reason")]
 
-    acoustic = _acoustic_features(transcript, calls_dir, call_id)
+    acoustic, unusable = _acoustic_features(transcript, calls_dir, call_id, allow_speech_fallback)
+    if acoustic is not None:
+        unusable = _unusable_reason(acoustic)
+
+    if unusable:
+        # Refuse to invent measurements. Writing NaNs or numbers taken from
+        # ordinary speech poisons the patient's history and produced confident
+        # "high severity" output from a call where nobody said anything.
+        logger.warning("call %s: not scoring this call — %s", call_id, unusable)
+        report_path = _write_unusable_report(call_id, patient_id, unusable, flags, calls_dir)
+        return {
+            "call_id": call_id, "patient_id": patient_id, "scored": False,
+            "reason": unusable, "flags": flags, "report_path": str(report_path),
+        }
+
     prosody = _prosody_features(transcript)
 
     from ml.features import build_feature_vector
@@ -169,6 +233,7 @@ def analyse_call(call_id: int, db_path: str = DB_PATH, calls_dir: Path = CALLS_D
     return {
         "call_id": call_id,
         "patient_id": patient_id,
+        "scored": True,
         "features": dataclasses.asdict(features),
         "predicted_score": prediction.predicted_score if prediction else None,
         "confidence_band": prediction.confidence_band if prediction else None,
@@ -194,6 +259,11 @@ def main() -> None:
     parser.add_argument("--latest", action="store_true", help="analyse the most recent recorded call")
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--calls-dir", default=str(CALLS_DIR))
+    parser.add_argument(
+        "--allow-speech-fallback", action="store_true",
+        help="if no phonation segment was recorded, measure ordinary speech instead "
+             "(for calls recorded before segments existed; the numbers are not comparable)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -207,7 +277,8 @@ def main() -> None:
         if call_id is None:
             parser.error("no recorded calls found")
 
-    result = analyse_call(call_id, db_path=args.db, calls_dir=calls_dir)
+    result = analyse_call(call_id, db_path=args.db, calls_dir=calls_dir,
+                          allow_speech_fallback=args.allow_speech_fallback)
     print(json.dumps(result, indent=2))
 
 

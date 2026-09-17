@@ -1191,9 +1191,15 @@ async def entrypoint(ctx) -> None:
                 # #3: the sustained vowel isn't speech, so record it from the
                 # microphone instead of waiting for a transcript that never comes.
                 start_s, end_s, voiced = await _record_phonation(recorder, listener, disconnected)
-                recorder.mark_segment(script.segment_name() or qid, start_s, end_s)
-                logger.info("%s: recorded %.1fs of patient audio (voice detected: %s)",
-                            qid, end_s - start_s, voiced)
+                if voiced:
+                    recorder.mark_segment(script.segment_name() or qid, start_s, end_s)
+                    logger.info("%s: recorded %.1fs of patient audio", qid, end_s - start_s)
+                else:
+                    # Don't mark silence as a phonation segment: the after-call
+                    # analysis would extract jitter/shimmer from nothing, write
+                    # NaN features, and still print a confident severity.
+                    logger.info("%s: no voice detected in %.1fs — no phonation segment",
+                                qid, end_s - start_s)
                 if not await move_on():
                     break
                 continue
