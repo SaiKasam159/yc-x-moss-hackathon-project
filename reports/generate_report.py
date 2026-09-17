@@ -54,32 +54,48 @@ def generate_report(
     Returns:
         CallReport with templated summary text
     """
-    sections = [
-        f"Patient {patient_id} | Call {features.call_id}",
-        f"Predicted UPDRS: {prediction.predicted_score} ({prediction.confidence_band})",
-    ]
+    # Measured first, modelled last. What follows above the score is measured
+    # directly from the patient's voice; the score is a model output that is
+    # not validated for a patient it hasn't heard (see ml/predict.py), so it
+    # must not be the headline.
+    sections = [f"Patient {patient_id} | Call {features.call_id}"]
 
-    # Add flag-based alerts
     if flags:
         alert_texts = [ALERT_TEMPLATES.get(f, f"Flag: {f}") for f in flags]
-        sections.append("Alerts:\n  • " + "\n  • ".join(alert_texts))
+        sections.append("Raised during the call:\n  • " + "\n  • ".join(alert_texts))
 
-    # Add feature summary
-    feature_summary = (
-        f"Acoustic profile: Jitter {features.jitter_local:.3f}%, "
-        f"Shimmer {features.shimmer_local:.2f}dB, "
-        f"HNR {features.hnr:.1f}dB, "
-        f"RPDE {features.rpde:.3f}"
+    # Units matter here: Praat's local jitter and shimmer are fractions, so
+    # they're shown as percentages. They were previously labelled "%" without
+    # converting, and shimmer was labelled "dB", which it isn't.
+    sections.append(
+        "Voice (measured): "
+        f"jitter {features.jitter_local * 100:.2f}% (RAP {features.jitter_rap * 100:.2f}%), "
+        f"shimmer {features.shimmer_local * 100:.2f}% (APQ5 {features.shimmer_apq5 * 100:.2f}%), "
+        f"HNR {features.hnr:.1f} dB"
     )
-    sections.append(feature_summary)
-
-    # Add prosody summary
-    prosody_summary = (
-        f"Speech: {features.speech_rate:.0f} wpm, "
-        f"Pause frequency {features.pause_freq:.2f}Hz, "
-        f"Avg pause {features.pause_avg_duration:.2f}s"
+    sections.append(
+        "Nonlinear (measured): "
+        f"RPDE {features.rpde:.3f}, DFA {features.dfa:.3f}, PPE {features.ppe:.3f}"
     )
-    sections.append(prosody_summary)
+    sections.append(
+        "Speech (measured): "
+        f"{features.speech_rate:.0f} words/min, "
+        f"{features.pause_freq:.2f} pauses/s, "
+        f"average pause {features.pause_avg_duration:.2f}s"
+    )
+    sections.append(
+        f"Model estimate (experimental): UPDRS {prediction.predicted_score} "
+        f"— {prediction.confidence_band}."
+    )
+    if prediction.anomaly_flag:
+        sections.append(
+            "  Note: this call's measurements fall outside the range the model "
+            "was trained on, so the estimate is extrapolation."
+        )
+    sections.append(
+        "Compare the measured values with this patient's own previous calls; "
+        "the model estimate is not a clinical measurement."
+    )
 
     summary_text = "\n".join(sections)
 
