@@ -27,6 +27,8 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
+import sys
 import time
 import wave
 from dataclasses import dataclass, field
@@ -468,6 +470,8 @@ class CallRecorder:
         self.last_voice_at_s: Optional[float] = None
         self._last_voice_monotonic: Optional[float] = None
         self.segments: list[dict] = []
+        # Triggers that fired during the call, for the report.
+        self.flags: list[dict] = []
 
         self._patient_wav = self._open_wav(self.audio_path)
         self._agent_wav = self._open_wav(self.agent_audio_path)
@@ -501,6 +505,14 @@ class CallRecorder:
         if self._last_voice_monotonic is None:
             return None
         return time.monotonic() - self._last_voice_monotonic
+
+    def log_flag(self, question_id: str, reason: str) -> None:
+        """Record a trigger that fired, so the after-call report can list it."""
+        self.flags.append({
+            "question_id": question_id,
+            "reason": reason,
+            "patient_audio_at_s": round(self.patient_seconds, 3),
+        })
 
     def mark_segment(
         self, name: str, start_s: float, end_s: float,
@@ -552,6 +564,7 @@ class CallRecorder:
                     "audio": {"patient": str(self.audio_path), "agent": str(self.agent_audio_path)},
                     "patient_audio_seconds": round(self.patient_seconds, 3),
                     "segments": self.segments,
+                    "flags": self.flags,
                     "turns": self.turns,
                 },
                 f, indent=2,
@@ -1011,6 +1024,25 @@ async def _record_phonation(
     return start_s, recorder.patient_seconds, voiced
 
 
+def _spawn_post_call_analysis(call_id: int) -> None:
+    """Start the after-call analysis in its own detached process.
+
+    Not inline: extracting features is heavy CPU that would stall the call,
+    and the LiveKit job is torn down as soon as the call ends, so anything
+    still running here would be killed. Output goes to the call's own log.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    log_path = CALLS_DIR / str(call_id) / "analysis.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "ab") as log:
+        subprocess.Popen(
+            [sys.executable, "-m", "agent.post_call", "--call-id", str(call_id)],
+            cwd=str(repo_root), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True, env=os.environ.copy(),
+        )
+    logger.info("after-call analysis started for call %s (log: %s)", call_id, log_path)
+
+
 async def _publish_transcript_line(room, speaker: str, text: str) -> None:
     """Send one transcript line to whoever has the call page open.
 
@@ -1192,6 +1224,8 @@ async def entrypoint(ctx) -> None:
             outcome = await handle_turn(
                 script, turn_ctx, utterance.text, speak=speak, word_timestamps=utterance.words
             )
+            if outcome.trigger.fired and outcome.trigger.reason:
+                recorder.log_flag(qid, outcome.trigger.reason)
             await speak(outcome.reply_text)
             if script.is_complete():
                 break
@@ -1213,6 +1247,11 @@ async def entrypoint(ctx) -> None:
             recorder.finalize()
         except Exception:
             logger.exception("failed to finalize call recording for call %s", turn_ctx.call_id)
+        else:
+            try:
+                _spawn_post_call_analysis(turn_ctx.call_id)
+            except Exception:
+                logger.exception("could not start after-call analysis for call %s", turn_ctx.call_id)
         try:
             # Persist this patient's Moss session for their next call.
             await push_patient_session(turn_ctx.patient_id)

@@ -92,9 +92,14 @@ def generate_report(
     )
 
 
-def push_report_to_moss(report: CallReport) -> None:
+async def push_report_to_moss(report: CallReport) -> None:
     """Push the report summary into Moss as a retrievable record, so a future
-    call's mid-call retrieval can surface "your last report noted X"."""
+    call's mid-call retrieval can surface "your last report noted X".
+
+    Must be awaited. This used to call the async ingest_qa_record without
+    awaiting it, so the coroutine was created, dropped, and nothing was ever
+    written.
+    """
     record = MossQARecord(
         patient_id=report.patient_id,
         call_id=report.call_id,
@@ -103,4 +108,4 @@ def push_report_to_moss(report: CallReport) -> None:
         answer_text=report.summary_text,
         timestamp=datetime.utcnow().isoformat() + "Z",
     )
-    ingest_qa_record(record)
+    await ingest_qa_record(record)
