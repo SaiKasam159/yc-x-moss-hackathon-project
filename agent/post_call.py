@@ -192,7 +192,14 @@ def analyse_call(
     """Analyse one finished call. Returns what it produced, for logging."""
     transcript = _load_transcript(call_id, calls_dir)
     patient_id = transcript["patient_id"]
-    flags = [f["reason"] for f in transcript.get("flags", []) if f.get("reason")]
+    # Flags the call itself later disproved are kept in transcript.json for
+    # audit but stay out of the report: a mis-transcribed answer ("autumn"
+    # heard as "awesome") otherwise leaves a healthy patient with a permanent
+    # disorientation flag even though they answered the clarifier correctly.
+    flags = [
+        f["reason"] for f in transcript.get("flags", [])
+        if f.get("reason") and not f.get("resolved")
+    ]
 
     acoustic, unusable = _acoustic_features(transcript, calls_dir, call_id, allow_speech_fallback)
     if acoustic is not None:

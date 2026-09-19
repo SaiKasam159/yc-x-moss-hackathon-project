@@ -106,7 +106,12 @@ PHONATION_MAX_S = float(os.environ.get("PHONATION_MAX_S", "20"))
 # Turn-taking (#4). Deepgram finalizes on very short pauses, so one spoken
 # answer arrives as several transcripts. Keep listening until the patient has
 # been quiet this long (no new transcript and no voice on the microphone).
-ANSWER_SETTLE_S = float(os.environ.get("ANSWER_SETTLE_S", "1.0"))
+#
+# 1.0s cut real patients off mid-sentence: on the first human call, "a bit of
+# stiffness in my" and "It's more it's" were both truncated where the patient
+# paused to think. Parkinson's speech pauses more, not less, so the window has
+# to tolerate a thinking pause. Costs up to a second of reply latency per turn.
+ANSWER_SETTLE_S = float(os.environ.get("ANSWER_SETTLE_S", "2.0"))
 ANSWER_MAX_S = float(os.environ.get("ANSWER_MAX_S", "30"))
 LONG_SPEECH_SETTLE_S = float(os.environ.get("LONG_SPEECH_SETTLE_S", "2.5"))
 LONG_SPEECH_MAX_S = float(os.environ.get("LONG_SPEECH_MAX_S", "60"))
@@ -514,6 +519,19 @@ class CallRecorder:
             "reason": reason,
             "patient_audio_at_s": round(self.patient_seconds, 3),
         })
+
+    def resolve_flags(self, question_id: str, note: str) -> int:
+        """Withdraw this question's flags after a later answer disproved them.
+
+        Marked rather than deleted, so transcript.json still shows what fired
+        and why it was withdrawn; only the report skips resolved flags.
+        """
+        resolved = 0
+        for flag in self.flags:
+            if flag["question_id"] == question_id and not flag.get("resolved"):
+                flag["resolved"] = note
+                resolved += 1
+        return resolved
 
     def mark_segment(
         self, name: str, start_s: float, end_s: float,
@@ -1233,6 +1251,18 @@ async def entrypoint(ctx) -> None:
             )
             if outcome.trigger.fired and outcome.trigger.reason:
                 recorder.log_flag(qid, outcome.trigger.reason)
+            elif qid.startswith("recall_check:"):
+                # Same qid as the answer that flagged: the script only advances
+                # once an orientation answer passes, so reaching here means the
+                # clarifier was answered correctly and the first answer was
+                # misheard, not wrong. Deepgram rendered "autumn" as "awesome"
+                # and left a healthy patient flagged as disoriented.
+                withdrawn = recorder.resolve_flags(
+                    qid, f"answered correctly on follow-up: {utterance.text!r}"
+                )
+                if withdrawn:
+                    logger.info("%s: withdrew %d flag(s) — the follow-up answer was correct",
+                                qid, withdrawn)
             await speak(outcome.reply_text)
             if script.is_complete():
                 break
@@ -1280,7 +1310,10 @@ def prewarm(proc) -> None:
     # Moss is deliberately not imported here: it runs in child processes
     # (agent/moss_worker.py) so its native core can't freeze calls.
     if OPENAI_API_KEY:
-        _get_llm_client()
+        # Touching .chat matters: everything under it is a lazy cached_property
+        # that imports ~30 modules on first use. Left until the first live
+        # follow-up, that import blocked the event loop for 248ms mid-call.
+        _ = _get_llm_client().chat
 
 
 def run_worker() -> None:
