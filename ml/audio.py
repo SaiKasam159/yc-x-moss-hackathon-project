@@ -230,18 +230,22 @@ def extract_prosody_features(audio_path: str, word_timestamps: list[dict]) -> di
             "pause_avg_duration": 0.0,
         }
 
-    # Get audio duration
-    y, sr = librosa.load(audio_path, sr=16000)
-    total_duration = len(y) / sr
+    # Time from the first word to the last, pauses included. Both earlier
+    # denominators were wrong. Summing each word's own duration excludes every
+    # pause, so counting read as 123 wpm when it was actually spoken at 62 —
+    # and pausing is precisely what Parkinson's affects, so discarding it
+    # removes the signal. The file's own length is no better: segments are cut
+    # with 0.3s of padding either side (agent._trim_to_words), which dilutes
+    # whatever is divided by it.
+    span_s = (max(w["end"] for w in word_timestamps)
+              - min(w["start"] for w in word_timestamps))
 
-    # Calculate speech rate (words per minute)
-    total_speech_time = sum(w["end"] - w["start"] for w in word_timestamps)
     num_words = len(word_timestamps)
-    speech_rate = (num_words / total_speech_time * 60) if total_speech_time > 0 else 0.0
+    speech_rate = (num_words / span_s * 60) if span_s > 0 else 0.0
 
     # Detect pauses
     pauses = detect_pauses(audio_path, word_timestamps)
-    pause_freq = len(pauses) / total_duration if total_duration > 0 else 0.0
+    pause_freq = len(pauses) / span_s if span_s > 0 else 0.0
     pause_avg_duration = (
         sum(p.duration_s for p in pauses) / len(pauses) if pauses else 0.0
     )
